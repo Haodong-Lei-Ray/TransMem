@@ -71,6 +71,8 @@ def parse_args():
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--dump_lm_head", action="store_true", default=True,
                    help="是否 dump 冻结 lm_head (off-policy KD 需要)")
+    p.add_argument("--thinking", action="store_true",
+                   help="chat prompt 是否用 thinking 系统提示 (build_chat_prompt_ids 的 thinking 参数)")
     return p.parse_args()
 
 
@@ -270,7 +272,8 @@ class Stage0Extractor:
     def generate_answer(self, cs_text: str, question: str):
         """教师 (C_S, Q) greedy 自回归生成, 生成时 hook 末位隐状态拿 HQ_tea_i.
         返回 (answer_ids [M], answer_text, hq_tea [M, dim])."""
-        cq_ids = build_chat_prompt_ids(self.tokenizer, cs_text, question, self.device)
+        cq_ids = build_chat_prompt_ids(self.tokenizer, cs_text, question, self.device,
+                                        thinking=self.args.thinking)
         prompt_len = cq_ids.shape[1]
 
         captured: list[torch.Tensor] = []
@@ -302,7 +305,8 @@ class Stage0Extractor:
         """(C_L, Q, A_[1:M-1]) -> (HM_stu [N, dim], HQ_stu_i [M, dim]).
         全程 token-id 空间拼接, 避免 BPE 边界 merge / 特殊 token 约定导致的位置错位."""
         M = len(answer_ids)
-        cq_ids = build_chat_prompt_ids(self.tokenizer, context_long, question, self.device)
+        cq_ids = build_chat_prompt_ids(self.tokenizer, context_long, question, self.device,
+                                        thinking=self.args.thinking)
         len_cq = cq_ids.shape[1]
         cl_ids = self.tokenizer(context_long, return_tensors="pt",
                                 add_special_tokens=False).input_ids.to(self.device)
@@ -459,7 +463,7 @@ def build_chat_prompt_ids(tokenizer, context: str, question: str, device=None, t
     teacher / student / 推理三处统一用它, 保证 prompt 格式一致 (对齐前提).
     """
     if thinking:
-        system_prompt_item={"role":"system","content":"You are a precise QA assistant. Answer with the short answer and thinking."}
+        system_prompt_item={"role":"system","content":"You are a precise QA assistant. Answer with the short answer and thinking. If you encounter a math problem, you should calculate it step by step. Think it through several times and criticize yourself a few times."}
     else:
         system_prompt_item={"role":"system","content":"You are a precise QA assistant. Answer ONLY with the short answer. No explanation."}
     messages = [
