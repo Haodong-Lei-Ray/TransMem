@@ -1,0 +1,49 @@
+{
+  "_comment": "TransMem 超参数: L 层 Qwen3 同款 decoder block + 零初始化读出. 默认对齐 Qwen3-4B-Instruct-2507.",
+
+  "dim": 2560,
+  "depth": 4,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 9728,
+  "rms_norm_eps": 1e-6,
+  "rope_theta": 5000000.0,
+  "max_position_embeddings": 262144,
+  "initializer_range": 0.02,
+  "attn_impl": "sdpa",
+
+  "causal": true,
+  "pos_mode": "rope",
+  "n_mem": 4,
+  "final_norm": true,
+  "zero_init_out": true,
+
+  "a_init": 1.0,
+  "learnable_a": false,
+  "warm_start": false,
+
+  "_notes": {
+    "dim": "= Qwen3-4B-Instruct-2507 hidden_size (2560)",
+    "depth": "TransMem 层数 L; 序列只有 N+1 很短, 几层够; 或 = 热启动取的顶层数",
+    "num_heads": "注意力头数, 对齐 backbone (32); q_proj: dim -> num_heads*head_dim = 4096",
+    "num_kv_heads": "GQA KV 头数, 对齐 backbone (8); kv_proj: dim -> num_kv_heads*head_dim = 1024",
+    "head_dim": "每头维度, 对齐 backbone (128); 注意 num_heads*head_dim != dim, Qwen3 用独立 head_dim",
+    "intermediate_size": "SwiGLU FFN 中间维, 对齐 backbone (9728); mlp_ratio = 9728/2560 ~= 3.8",
+    "rms_norm_eps": "对齐 backbone (1e-6)",
+    "rope_theta": "对齐 backbone (5e6, 实测 config 值, 非 plan 写的 1e6)",
+    "max_position_embeddings": "RoPE 频率表上界, 对齐 backbone (262144)",
+    "initializer_range": "冷启动时 block 权重初始化 std, 对齐 backbone (0.02)",
+    "attn_impl": "Qwen3 注意力实现: sdpa(GPU 推荐) / eager(CPU 安全) / flash_attention_2",
+
+    "causal": "true=因果 mask(查询放末尾, attend 前面所有记忆); false=记忆槽间双向可见",
+    "pos_mode": "位置注入方式, 解耦对比: none=不再注入(hidden 已烤进 backbone 绝对位置, RoPE 用全0位置=恒等旋转) / rope=对 0..N 套 RoPE(plan 原方案) / learned=零初始化可学位置 embedding + RoPE关",
+    "n_mem": "记忆分段数 N (= HM_stu 段数); 仅 learned 位置 embedding 的长度 N+1 用到, 模型本身按输入实际长度工作",
+    "final_norm": "读出前是否过一层 Qwen3RMSNorm",
+    "zero_init_out": "out_proj 零初始化 -> 初始 MS=0 -> HQ'=HQ_stu 恒等, 训练更稳(文献一致做法)",
+
+    "a_init": "HQ' = HQ_stu + a*MS 里的标量 a, 默认 1",
+    "learnable_a": "a 是否可学习; false 则固定为 a_init",
+    "warm_start": "是否用 backbone 顶部 depth 层权重热启动; 若 true 建议把 Stage0 hidden 源改成 pre-norm 残差流以匹配表征空间(见 docs)"
+  }
+}
