@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -210,6 +211,7 @@ class OnPolicyTrainer:
             (p for p in self.mem.parameters() if p.requires_grad),
             lr=args.lr, weight_decay=args.weight_decay)
         self.global_step = 0
+        self.writer = SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
         print(f"TransMem: {self.mem.num_params(True):,} trainable | "
               f"loss={args.divergence} T={args.temperature} | "
               f"accum={args.accum_steps} sample={args.sample}")
@@ -306,18 +308,28 @@ class OnPolicyTrainer:
                 if self.global_step % args.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
                     sps = args.log_interval / max(time.time() - t0, 1e-3)
+                    mem_gb = torch.cuda.max_memory_allocated() / 1024**3
+                    avg_loss = running["loss"] / max(n_in_window, 1)
+                    avg_div = running["div"] / max(n_in_window, 1)
                     print(f"  step {self.global_step:6d}/{args.max_steps} | "
-                          f"loss {running['loss']/max(n_in_window,1):.5f} | "
-                          f"div {running['div']/max(n_in_window,1):.5f} | lr {lr:.2e} | "
-                          f"{sps:.2f} it/s | mem {torch.cuda.max_memory_allocated()/1024**3:.1f}GB")
+                          f"loss {avg_loss:.5f} | "
+                          f"div {avg_div:.5f} | lr {lr:.2e} | "
+                          f"{sps:.2f} it/s | mem {mem_gb:.1f}GB")
+                    self.writer.add_scalar("train/loss", avg_loss, self.global_step)
+                    self.writer.add_scalar("train/div", avg_div, self.global_step)
+                    self.writer.add_scalar("train/lr", lr, self.global_step)
+                    self.writer.add_scalar("train/it_per_s", sps, self.global_step)
+                    self.writer.add_scalar("train/mem_gb", mem_gb, self.global_step)
                     running = {"loss": 0.0, "div": 0.0}
                     n_in_window = 0
                     t0 = time.time()
                 if self.global_step % args.save_interval == 0:
                     self.save(args.output_dir)
         self.save(args.output_dir)
+        self.writer.close()
         print("=" * 72)
         print(f"✅ on-policy (OPD) 训练完成: {self.global_step} steps")
+        print(f"TensorBoard: tensorboard --logdir {Path(args.output_dir) / 'tb'}")
 
     def save(self, path, metrics=None):
         Path(path).mkdir(parents=True, exist_ok=True)

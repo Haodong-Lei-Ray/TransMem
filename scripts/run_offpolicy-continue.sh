@@ -41,6 +41,7 @@ $PY -m transmem.train_offpolicy \
   ${STEP:+--max_steps $STEP} \
   --warmup_steps 500 --grad_clip 1.0 \
   --dtype float32 --num_workers 4 \
-  --log_interval $LogInterval --val_interval 1000 --save_interval $SaveInterval
+  --log_interval $LogInterval --val_interval 1000 --save_interval $SaveInterval \
+  --resume $PROJ/checkpoints/offpolicy_${TAG}_${DIV}/latest.pt
 
 echo "✅ off-policy 训练完成"

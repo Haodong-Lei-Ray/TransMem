@@ -50,7 +50,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MODEL_PATH=${MODEL_PATH:-${MOUNT_POINT}/leihaodong/Qwen/Qwen3-4B-Instruct-2507}
+MODEL_PATH=${MODEL_PATH:-${MOUNT_POINT}/leihaodong/Qwen/Qwen3-8B}
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "FATAL: 模型不可见 ${MODEL_PATH} (s3mount 失败?)" >&2
   ls -la "${MOUNT_POINT}/leihaodong/Qwen/" >&2 || true
@@ -64,7 +64,7 @@ cd $PROJ
 $PY -m transmem.extract_features \
   --data_path $DATA/qasper_train.json --data_format qasper \
   --model_path $MODEL_PATH \
-  --output_dir $PROJ/data/qasper_data/stage0_train_short128 \
+  --output_dir $PROJ/data/qasper_data/Qwen3-8B/stage0_train_short$MAX_ANS \
   --N $N --max_answer_tokens $MAX_ANS \
   --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
   $([ "$THINKING" = "true" ] && echo --thinking)
@@ -73,7 +73,7 @@ $PY -m transmem.extract_features \
 $PY -m transmem.extract_features \
   --data_path $DATA/qasper_dev.json --data_format qasper \
   --model_path $MODEL_PATH \
-  --output_dir $PROJ/data/qasper_data/stage0_dev_short128 \
+  --output_dir $PROJ/data/qasper_data/Qwen3-8B/stage0_dev_short$MAX_ANS \
   --N $N --max_answer_tokens $MAX_ANS \
   --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
   $([ "$THINKING" = "true" ] && echo --thinking)

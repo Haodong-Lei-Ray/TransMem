@@ -16,9 +16,9 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY   # 内网/S3, 关代理
 export all_proxy= ALL_PROXY=
 
 UV=/mnt/petrelfs/leihaodong/anaconda3/bin/uv
+PROJ=/mnt/petrelfs/leihaodong/Project4
 VENV=$PROJ/.venv-transmem
 PY="$UV run --python $VENV/bin/python python"
-PROJ=/mnt/petrelfs/leihaodong/Project4
 DATA=/mnt/petrelfs/leihaodong/Project4/data/qasper
 
 N=${N:-4}
@@ -26,6 +26,7 @@ MAX_ANS=${MAX_ANS:-128}
 ATTN=${ATTN:-sdpa}          # flash_attention_2 在本 venv import 失败, 默认 sdpa
 MAXN=${MAXN:-}              # 可选: 只抽前 MAXN 条 (先小跑); 空=全量
 THINKING=${THINKING:-false} # true=开启 thinking 系统提示 (build_chat_prompt_ids thinking=True)
+ModelName=${ModelName:-Qwen/Qwen3-14B}
 
 # ── s3mount: 挂载 Qwen3-4B 模型 (权重是 S3 存储对象, 本地无) ──────────────
 mkdir -p /mnt/petrelfs/leihaodong/s3mount_logs
@@ -50,7 +51,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MODEL_PATH=${MODEL_PATH:-${MOUNT_POINT}/leihaodong/Qwen/Qwen3-4B-Instruct-2507}
+MODEL_PATH=${MODEL_PATH:-${MOUNT_POINT}/leihaodong/${ModelName}}
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "FATAL: 模型不可见 ${MODEL_PATH} (s3mount 失败?)" >&2
   ls -la "${MOUNT_POINT}/leihaodong/Qwen/" >&2 || true
@@ -64,7 +65,7 @@ cd $PROJ
 $PY -m transmem.extract_features \
   --data_path $DATA/qasper_train.json --data_format qasper \
   --model_path $MODEL_PATH \
-  --output_dir $PROJ/data/qasper_data/stage0_train_short128 \
+  --output_dir $PROJ/data/qasper_data/$ModelName/stage0_train_short$MAX_ANS \
   --N $N --max_answer_tokens $MAX_ANS \
   --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
   $([ "$THINKING" = "true" ] && echo --thinking)
@@ -73,7 +74,7 @@ $PY -m transmem.extract_features \
 $PY -m transmem.extract_features \
   --data_path $DATA/qasper_dev.json --data_format qasper \
   --model_path $MODEL_PATH \
-  --output_dir $PROJ/data/qasper_data/stage0_dev_short128 \
+  --output_dir $PROJ/data/qasper_data/$ModelName/stage0_dev_short$MAX_ANS \
   --N $N --max_answer_tokens $MAX_ANS \
   --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
   $([ "$THINKING" = "true" ] && echo --thinking)

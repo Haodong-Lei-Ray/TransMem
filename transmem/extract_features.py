@@ -455,23 +455,38 @@ def _make_prompt(context: str, question: str) -> str:
     return f"Context:\n{context}\n\nQuestion:\n{question}"
 
 
+def _supports_enable_thinking(tokenizer) -> bool:
+    """chat template 里是否原生带 enable_thinking 开关 (Qwen3 hybrid-thinking 系列,
+    如 Qwen3-8B/14B/32B). Qwen3-4B-Instruct-2507 这类纯 instruct 模型没有这个开关,
+    该模型不管 system prompt 写什么都不会自己吐 <think>, 靠 system prompt 兜底即可;
+    hybrid 模型不看 system prompt, 必须靠这个模板开关才能真正关/开思考 (否则 128 token
+    的 max_answer_tokens 会被 <think> 独吞, 答案都生成不出来)."""
+    chat_template = getattr(tokenizer, "chat_template", None) or ""
+    return "enable_thinking" in chat_template
+
+
 def build_chat_prompt_ids(tokenizer, context: str, question: str, device=None, thinking=False):
-    """按 Qwen3 chat template 构造 prompt token ids (add_generation_prompt=True).
+    """按 chat template 构造 prompt token ids (add_generation_prompt=True).
 
     这样是"对话"而非"文本续写", 模型答完会正常吐 <|im_end|>(151645) 停下,
     AN 自适应真实答案长度, 不再一路跑到 max_answer_tokens (官方推荐用法).
     teacher / student / 推理三处统一用它, 保证 prompt 格式一致 (对齐前提).
     """
-    if thinking:
-        system_prompt_item={"role":"system","content":"You are a precise QA assistant. Answer with the short answer and thinking. If you encounter a math problem, you should calculate it step by step. Think it through several times and criticize yourself a few times."}
+    template_kwargs = {}
+    if _supports_enable_thinking(tokenizer):
+        # hybrid-thinking 模型: 用官方开关控制, 不走 system prompt 文字 hack.
+        system_prompt_item = {"role": "system", "content": "You are a precise QA assistant."}
+        template_kwargs["enable_thinking"] = thinking
+    elif thinking:
+        system_prompt_item = {"role": "system", "content": "You are a precise QA assistant. Answer with the short answer and thinking. If you encounter a math problem, you should calculate it step by step. Think it through several times and criticize yourself a few times."}
     else:
-        system_prompt_item={"role":"system","content":"You are a precise QA assistant. Answer ONLY with the short answer. No explanation."}
+        system_prompt_item = {"role": "system", "content": "You are a precise QA assistant. Answer ONLY with the short answer. No explanation."}
     messages = [
         system_prompt_item,
         {"role": "user", "content": _make_prompt(context, question)}
         ]
     text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)     # 官方示例写法
+        messages, tokenize=False, add_generation_prompt=True, **template_kwargs)  # 官方示例写法
     # 模板已含全部特殊 token, add_special_tokens=False 避免再加 bos/eos (与 student 侧一致)
     ids = tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids
     return ids.to(device) if device is not None else ids

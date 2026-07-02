@@ -32,6 +32,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -189,6 +190,7 @@ class OffPolicyTrainer:
             lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
         self.global_step = 0
         self.epoch = 0
+        self.writer = SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
 
     def _warm_start(self):
         if not self.args.model_path:
@@ -212,40 +214,59 @@ class OffPolicyTrainer:
         for g in self.optimizer.param_groups:
             g["lr"] = lr
 
-    def compute_loss(self, X, hq_tea):
-        """X [B,N+1,dim], hq_tea [B,dim] -> (loss, metrics)."""
+    def compute_loss(self, X, hq_tea, full: bool = False):
+        """X [B,N+1,dim], hq_tea [B,dim] -> (loss, metrics).
+
+        full=True 时额外算 baseline(MS=0)散度与改善比 (多一次 lm_head, 只在 log/val 步用).
+        ms_norm / top1 恒算 (近乎零成本).
+        """
         hq_stu = X[:, -1, :]                       # 查询槽 = 末位
         ms = self.mem(X)
         hq_prime = self.mem.correct(ms, hq_stu)
         student_logits = self.lm_head(hq_prime)
         with torch.no_grad():
             teacher_logits = self.lm_head(hq_tea)
-        return self.loss_fn(student_logits, teacher_logits, hq_prime, hq_tea)
+        loss, metrics = self.loss_fn(student_logits, teacher_logits, hq_prime, hq_tea)
 
-    def train_step(self, X, hq_tea):
+        # ── 诊断量 (不进 loss, 纯监控) ──────────────────────────────────
+        with torch.no_grad():
+            metrics["ms_norm"] = float(ms.norm(dim=-1).mean())   # 记忆偏置强度: 0->涨->稳
+            metrics["top1"] = float(                             # 纠正后学生与教师 argmax 一致率
+                (student_logits.argmax(-1) == teacher_logits.argmax(-1)).float().mean())
+            if full:
+                base_logits = self.lm_head(hq_stu)               # MS=0 未纠正的学生
+                bd = float(self.loss_fn.divergence_only(base_logits, teacher_logits))
+                metrics["base_div"] = bd                         # 初始 gap (student(C_L) vs teacher(C_S))
+                metrics["improve"] = ((bd - metrics["div"]) / bd) if bd > 1e-8 else 0.0
+        return loss, metrics
+
+    def train_step(self, X, hq_tea, full: bool = False):
         self.mem.train()
-        loss, metrics = self.compute_loss(X, hq_tea)
+        loss, metrics = self.compute_loss(X, hq_tea, full=full)
         self.optimizer.zero_grad()
         loss.backward()
         if self.args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.mem.parameters(), self.args.grad_clip)
+            gn = torch.nn.utils.clip_grad_norm_(self.mem.parameters(), self.args.grad_clip)
+            metrics["grad_norm"] = float(gn)                     # 裁剪前总范数: 看是否爆/削
         self.optimizer.step()
         return metrics
 
     @torch.no_grad()
     def validate(self, dataloader, max_batches=50):
         self.mem.eval()
-        tot = 0.0
+        agg = {"val_loss": 0.0, "val_top1": 0.0, "val_improve": 0.0}
         n = 0
         for X, hq_tea in dataloader:
             X = X.to(self.device)
             hq_tea = hq_tea.to(self.device)
-            _, m = self.compute_loss(X, hq_tea)
-            tot += m["loss"]
+            _, m = self.compute_loss(X, hq_tea, full=True)
+            agg["val_loss"] += m["loss"]
+            agg["val_top1"] += m["top1"]
+            agg["val_improve"] += m.get("improve", 0.0)
             n += 1
             if n >= max_batches:
                 break
-        return {"val_loss": tot / max(n, 1)}
+        return {k: v / max(n, 1) for k, v in agg.items()}
 
     def save(self, path, metrics=None):
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -283,9 +304,18 @@ class OffPolicyTrainer:
             X, hq_tea = next(iter(train_dl))
             X, hq_tea = X.to(self.device), hq_tea.to(self.device)
             for step in range(500):
-                m = self.train_step(X, hq_tea)
+                m = self.train_step(X, hq_tea, full=(step % 50 == 0))
+                self.writer.add_scalar("train/loss", m["loss"], step)
+                self.writer.add_scalar("train/div", m["div"], step)
+                self.writer.add_scalar("train/ms_norm", m["ms_norm"], step)
+                self.writer.add_scalar("train/top1", m["top1"], step)
+                if "grad_norm" in m:
+                    self.writer.add_scalar("train/grad_norm", m["grad_norm"], step)
                 if step % 50 == 0:
-                    print(f"  step {step:4d}: loss={m['loss']:.6f} div={m['div']:.6f}")
+                    print(f"  step {step:4d}: loss={m['loss']:.6f} div={m['div']:.6f} "
+                          f"top1={m['top1']:.3f} ms_norm={m['ms_norm']:.3f} "
+                          f"improve={m.get('improve', 0.0):.3f}")
+            self.writer.close()
             return
 
         best_val = float("inf")
@@ -298,21 +328,44 @@ class OffPolicyTrainer:
                     break
                 self._set_lr(self.global_step, total_steps)
                 X, hq_tea = X.to(self.device), hq_tea.to(self.device)
-                m = self.train_step(X, hq_tea)
+                # 该步过后若触发 log, 就算上 baseline 诊断 (base_div/improve)
+                full = ((self.global_step + 1) % args.log_interval == 0)
+                m = self.train_step(X, hq_tea, full=full)
                 self.global_step += 1
                 running += m["loss"]
                 if self.global_step % args.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
                     sps = args.log_interval / max(time.time() - t0, 1e-3)
+                    mem_gb = torch.cuda.max_memory_allocated() / 1024**3
                     print(f"  step {self.global_step:7d}/{total_steps} | "
                           f"loss {running/args.log_interval:.6f} | lr {lr:.2e} | "
-                          f"{sps:.1f} it/s | "
-                          f"mem {torch.cuda.max_memory_allocated()/1024**3:.1f}GB")
+                          f"top1 {m['top1']:.3f} | improve {m.get('improve', 0.0):.3f} | "
+                          f"ms {m['ms_norm']:.2f} | gnorm {m.get('grad_norm', 0.0):.2f} | "
+                          f"{sps:.1f} it/s | mem {mem_gb:.1f}GB")
+                    self.writer.add_scalar("train/loss", running / args.log_interval, self.global_step)
+                    self.writer.add_scalar("train/lr", lr, self.global_step)
+                    self.writer.add_scalar("train/it_per_s", sps, self.global_step)
+                    self.writer.add_scalar("train/mem_gb", mem_gb, self.global_step)
+                    self.writer.add_scalar("train/ms_norm", m["ms_norm"], self.global_step)
+                    self.writer.add_scalar("train/top1", m["top1"], self.global_step)
+                    if "grad_norm" in m:
+                        self.writer.add_scalar("train/grad_norm", m["grad_norm"], self.global_step)
+                    if "base_div" in m:
+                        self.writer.add_scalar("train/base_div", m["base_div"], self.global_step)
+                        self.writer.add_scalar("train/improve", m["improve"], self.global_step)
+                    if "div" in m:
+                        self.writer.add_scalar("train/div", m["div"], self.global_step)
+                    if "reg" in m:
+                        self.writer.add_scalar("train/reg", m["reg"], self.global_step)
                     running = 0.0
                     t0 = time.time()
                 if val_dl and self.global_step % args.val_interval == 0:
                     vm = self.validate(val_dl)
-                    print(f"  --- VAL step {self.global_step}: val_loss={vm['val_loss']:.6f} ---")
+                    print(f"  --- VAL step {self.global_step}: val_loss={vm['val_loss']:.6f} "
+                          f"val_top1={vm['val_top1']:.3f} val_improve={vm['val_improve']:.3f} ---")
+                    self.writer.add_scalar("val/loss", vm["val_loss"], self.global_step)
+                    self.writer.add_scalar("val/top1", vm["val_top1"], self.global_step)
+                    self.writer.add_scalar("val/improve", vm["val_improve"], self.global_step)
                     if vm["val_loss"] < best_val:
                         best_val = vm["val_loss"]
                         self.save(args.output_dir, {"val_loss": best_val, "best": True})
@@ -320,9 +373,11 @@ class OffPolicyTrainer:
                     self.save(args.output_dir)
         final = self.validate(val_dl, max_batches=200) if val_dl else {}
         self.save(args.output_dir, final)
+        self.writer.close()
         print("=" * 72)
         print(f"✅ off-policy 训练完成: {self.global_step} steps"
               + (f", val_loss={final.get('val_loss', float('nan')):.6f}" if final else ""))
+        print(f"TensorBoard: tensorboard --logdir {Path(args.output_dir) / 'tb'}")
 
 
 def main():

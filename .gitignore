@@ -219,3 +219,7 @@ __marimo__/
 
 /Qwen3
 /data
+scripts/smoke
+/docs
+/logs
+/checkpoints

@@ -110,6 +110,21 @@ class DistillLoss:
         metrics["loss"] = float(loss.detach())
         return loss, metrics
 
+    @torch.no_grad()
+    def divergence_only(self, student_logits: torch.Tensor,
+                        teacher_logits: torch.Tensor) -> torch.Tensor:
+        """只算散度标量 (无 reg / 无计算图), 用于诊断 baseline (MS=0 未纠正) 的 KL."""
+        T = self.temperature
+        s = student_logits.float() / T
+        t = teacher_logits.float() / T
+        if self.divergence == "forward_kl":
+            div = _kl_from_logits(t, s)
+        elif self.divergence == "reverse_kl":
+            div = _kl_from_logits(s, t)
+        else:
+            div = _jsd_from_logits(t, s, self.jsd_beta)
+        return div * (T * T)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 冻结 LM head (穿它把 hidden -> logits, 梯度回传到 TransMem)
