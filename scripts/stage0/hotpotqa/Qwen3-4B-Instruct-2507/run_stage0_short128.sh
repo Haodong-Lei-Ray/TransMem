@@ -15,11 +15,11 @@ set -e
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY   # 内网/S3, 关代理
 export all_proxy= ALL_PROXY=
 
-PROJ=/mnt/petrelfs/leihaodong/Project4
 UV=/mnt/petrelfs/leihaodong/anaconda3/bin/uv
 VENV=$PROJ/.venv-transmem
 PY="$UV run --python $VENV/bin/python python"
-DATA=/mnt/petrelfs/leihaodong/Project4/data/qasper
+PROJ=/mnt/petrelfs/leihaodong/Project4
+DATA=/mnt/petrelfs/leihaodong/Project4/data/hotpotqa-benchmark
 
 N=${N:-4}
 MAX_ANS=${MAX_ANS:-128}
@@ -62,7 +62,7 @@ cd $PROJ
 
 # 训练集 (2240 QA)
 $PY -m transmem.extract_features \
-  --data_path $DATA/qasper_train.json --data_format qasper \
+  --data_path $DATA/hotpotqa-agentmem --data_format hotpotqa-agentmem \
   --model_path $MODEL_PATH \
   --output_dir $PROJ/data/qasper_data/stage0_train_short128 \
   --N $N --max_answer_tokens $MAX_ANS \
@@ -71,7 +71,7 @@ $PY -m transmem.extract_features \
 
 # 验证集 (927 QA)
 $PY -m transmem.extract_features \
-  --data_path $DATA/qasper_dev.json --data_format qasper \
+  --data_path $DATA/hotpotqa-agentmem --data_format hotpotqa-agentmem \
   --model_path $MODEL_PATH \
   --output_dir $PROJ/data/qasper_data/stage0_dev_short128 \
   --N $N --max_answer_tokens $MAX_ANS \

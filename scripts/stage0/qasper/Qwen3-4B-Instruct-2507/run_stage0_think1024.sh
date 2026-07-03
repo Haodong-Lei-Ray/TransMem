@@ -15,10 +15,10 @@ set -e
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY   # 内网/S3, 关代理
 export all_proxy= ALL_PROXY=
 
+PROJ=/mnt/petrelfs/leihaodong/Project4
 UV=/mnt/petrelfs/leihaodong/anaconda3/bin/uv
 VENV=$PROJ/.venv-transmem
 PY="$UV run --python $VENV/bin/python python"
-PROJ=/mnt/petrelfs/leihaodong/Project4
 DATA=/mnt/petrelfs/leihaodong/Project4/data/qasper
 
 N=${N:-4}

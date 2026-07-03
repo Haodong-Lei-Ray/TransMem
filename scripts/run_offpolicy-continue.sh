@@ -30,6 +30,7 @@ REG=${REG:-0.0}
 STEP=${STEP:-}             # 可选: 硬截 backward 步数 (冒烟用); 空=按 epochs 跑全量
 SaveInterval=${SaveInterval:-5000}             # 可选: 硬截 backward 步数 (冒烟用); 空=按 epochs 跑全量
 LogInterval=${LogInterval:-50}
+EpochNum=${EpochNum:-30}
 
 $PY -m transmem.train_offpolicy \
   --data_dir $DATA_ROOT/stage0_train_${TAG} \
@@ -37,7 +38,7 @@ $PY -m transmem.train_offpolicy \
   --config $PROJ/transmem/config.json \
   --output_dir $PROJ/checkpoints/offpolicy_${TAG}_${DIV} \
   --divergence $DIV --temperature $TEMP --reg_weight $REG \
-  --batch_size 128 --lr 1e-4 --epochs 30 \
+  --batch_size 128 --lr 1e-4 --epochs $EpochNum \
   ${STEP:+--max_steps $STEP} \
   --warmup_steps 500 --grad_clip 1.0 \
   --dtype float32 --num_workers 4 \

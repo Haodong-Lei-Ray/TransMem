@@ -55,7 +55,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Stage 0: 离线抽取 LLM hidden states (TransMem)")
     p.add_argument("--data_path", required=True, help="数据路径 (.parquet 或 .json)")
     p.add_argument("--data_format", default="parquet",
-                   choices=["parquet", "json", "qasper"])
+                   choices=["parquet", "json", "qasper", "hotpotqa-agentmem"])
     p.add_argument("--model_path", required=True, help="Qwen3-4B-Instruct-2507 路径")
     p.add_argument("--output_dir", required=True, help="输出目录, 写 sharded .pt + lm_head.pt")
     p.add_argument("--device", default="cuda:0")
@@ -91,6 +91,8 @@ def load_records(data_path: str, data_format: str, max_samples: Optional[int]):
         if max_samples:
             df = df.head(max_samples)
         return [_parse_parquet_row(df.iloc[i], i) for i in range(len(df))]
+    if data_format == "hotpotqa-agentmem":
+        return _load_hotpotqa_agentmem(data_path, max_samples)
     with open(data_path) as f:
         raw = json.load(f)
     if data_format == "qasper":
@@ -126,6 +128,66 @@ def _parse_parquet_row(row, idx: int) -> dict:
 
     return {"question": question, "context": context, "golden_index": golden_index,
             "ground_truth": ground_truth, "sample_idx": idx}
+
+
+# ── hotpotqa-agentmem: MemAgent 数据 (无 golden_index, 需 golden_titles_map 回填) ──
+
+def _load_hotpotqa_agentmem(data_path: str, max_samples: Optional[int]):
+    """加载 BytedTsinghua-SIA/hotpotqa parquet, 通过 golden_titles_map.json
+    回填 golden_index (证据文档编号)."""
+    import re
+    import os
+
+    df = pd.read_parquet(data_path)
+    if max_samples:
+        df = df.head(max_samples)
+
+    # 加载 golden_titles_map (同目录下)
+    map_path = os.path.join(os.path.dirname(data_path), "golden_titles_map.json")
+    if not os.path.exists(map_path):
+        print(f"  [WARN] 未找到 golden_titles_map.json ({map_path}), C_S 将为空")
+        title_map = {}
+    else:
+        with open(map_path) as f:
+            title_map = json.load(f)
+
+    records = []
+    doc_header_re = re.compile(r"^Document (\d+):\s*(.+)$", re.MULTILINE)
+    missing_golden = 0
+    for i in range(len(df)):
+        row = df.iloc[i]
+        rec = _parse_parquet_row(row, i)
+        if not rec["context"]:
+            records.append(rec)
+            continue
+
+        # 按 question 文本查 golden_titles_map
+        q = rec["question"].strip()
+        golden_titles = title_map.get(q) or title_map.get(q.lower()) or []
+        if not golden_titles:
+            missing_golden += 1
+            records.append(rec)
+            continue
+
+        # 在 context 中找 "Document N: {title}" 匹配
+        golden_index = None
+        for m in doc_header_re.finditer(rec["context"]):
+            doc_num = int(m.group(1))
+            doc_title = m.group(2).strip()
+            for gt in golden_titles:
+                if gt.lower() in doc_title.lower():
+                    golden_index = doc_num
+                    break
+            if golden_index is not None:
+                break
+
+        rec["golden_index"] = golden_index
+        records.append(rec)
+
+    if missing_golden > 0:
+        print(f"  hotpotqa-agentmem: {missing_golden}/{len(records)} 条找不到 golden 标题")
+    print(f"  hotpotqa-agentmem: {len(records)} 条已加载")
+    return records
 
 
 def _parse_json_item(item: dict, idx: int) -> dict:
