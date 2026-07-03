@@ -16,6 +16,7 @@
   "causal": true,
   "pos_mode": "rope",
   "n_mem": 4,
+  "max_queries": 256,
   "final_norm": true,
   "zero_init_out": true,
 
@@ -36,9 +37,10 @@
     "initializer_range": "冷启动时 block 权重初始化 std, 对齐 backbone (0.02)",
     "attn_impl": "Qwen3 注意力实现: sdpa(GPU 推荐) / eager(CPU 安全) / flash_attention_2",
 
-    "causal": "true=因果 mask(查询放末尾, attend 前面所有记忆); false=记忆槽间双向可见",
-    "pos_mode": "位置注入方式, 解耦对比: none=不再注入(hidden 已烤进 backbone 绝对位置, RoPE 用全0位置=恒等旋转) / rope=对 0..N 套 RoPE(plan 原方案) / learned=零初始化可学位置 embedding + RoPE关",
-    "n_mem": "记忆分段数 N (= HM_stu 段数); 仅 learned 位置 embedding 的长度 N+1 用到, 模型本身按输入实际长度工作",
+    "causal": "true=因果 mask(位置 i 的 query 看 {HM, HQ_1..i}, 序列语义/KV cache 的前提); false=全双向可见(与 token-by-token 推理不兼容, 仅消融)",
+    "pos_mode": "位置注入方式, 解耦对比: none=不再注入(hidden 已烤进 backbone 绝对位置, RoPE 用全0位置=恒等旋转) / rope=对全局位置套 RoPE(plan 原方案) / learned=零初始化可学位置 embedding + RoPE关",
+    "n_mem": "记忆分段数 N (= HM_stu 段数); query 槽从第 N 位开始, 模型本身按输入实际长度工作",
+    "max_queries": "learned 位置 embedding 覆盖的最大 query 数(embedding 长度=n_mem+max_queries); rope/none 模式不用",
     "final_norm": "读出前是否过一层 Qwen3RMSNorm",
     "zero_init_out": "out_proj 零初始化 -> 初始 MS=0 -> HQ'=HQ_stu 恒等, 训练更稳(文献一致做法)",
 

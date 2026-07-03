@@ -1,10 +1,14 @@
-"""TransMem: L 层 Qwen3 同款 decoder block + 零初始化读出, 一次前向回归记忆偏置 MS.
+"""TransMem: L 层 Qwen3 同款 decoder block + 零初始化读出, 回归记忆偏置 MS.
 
-  输入   X_i = [HM_stu ; HQ_stu_i]            [B, N+1, dim]   (查询槽放末尾)
-         L 层 Qwen3 block (causal, RoPE)
-         读末位查询槽 -> final_norm -> out_proj(零初始化)
-  输出   MS_i                                  [B, dim]
-  读出   HQ'_i = HQ_stu_i + a * MS_i           [B, dim]   (逐元素相加)
+TransMem 自己就是一个小自回归 decoder (docs/version2/transmem正常化修改意见.md):
+  序列   X = [HM_stu ; HQ_stu_1 .. HQ_stu_M]   [B, N+M, dim]
+         L 层 Qwen3 block (causal, RoPE) — 位置 i 的 query 因果地看到
+         {HM_1..N, HQ_1..i}, 而不是只看固定记忆 + 孤立当前查询.
+  读出   final_norm -> out_proj(零初始化):
+         训练 (teacher-forcing 并行): return_all_queries=True -> MS_1..M [B, M, dim]
+         推理 (token-by-token):       past_key_values=DynamicCache 增量前向,
+                                      每步只喂新 HQ_i [B,1,dim], 读末位 -> MS_i [B, dim]
+  纠正   HQ'_i = HQ_stu_i + a * MS_i            (逐元素相加)
 
 LLM 全程冻结, TransMem 是唯一可训练模块. out_proj 零初始化使初始 MS=0 -> HQ'=HQ_stu
 恒等, 训练更稳. block 与 backbone 同款, 可选用 backbone 顶部 L 层热启动.
@@ -57,9 +61,10 @@ class TransMemConfig:
     attn_impl: str = "sdpa"
 
     # ── TransMem 专属 (可解耦对比) ────────────────────────────────────
-    causal: bool = True            # 因果 mask(查询末尾) vs 记忆槽双向
+    causal: bool = True            # 因果 mask(查询看历史) vs 全双向
     pos_mode: str = "rope"         # none | rope | learned (位置注入方式)
-    n_mem: int = 4                 # 记忆分段数 N (learned 位置 embedding 长度 N+1 用)
+    n_mem: int = 4                 # 记忆分段数 N (query 槽从第 N 位开始)
+    max_queries: int = 256         # learned 位置 embedding 覆盖的最大 query 数 (长度 N+max_queries)
     final_norm: bool = True        # 读出前是否过 Qwen3RMSNorm
     zero_init_out: bool = True     # out_proj 零初始化 -> 初始 MS=0
 
@@ -85,10 +90,13 @@ class TransMemConfig:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TransMem(nn.Module):
-    """记忆偏置网络: L 层 Qwen3 block + 零初始化读出.
+    """记忆偏置网络: L 层 Qwen3 block + 零初始化读出 (自身是小自回归 decoder).
 
-    forward(X) -> MS:  X [B, N+1, dim] -> MS [B, dim] (读末位查询槽).
-    correct(MS, HQ_stu) -> HQ':  HQ'_i = HQ_stu_i + a*MS_i.
+    forward(X) -> MS: 三种用法 (见 forward docstring):
+      默认            X [B, S, dim] -> 读末位 [B, dim]
+      并行读全部 query return_all_queries=True -> [B, S-N, dim]  (训练)
+      增量 KV cache    past_key_values + use_cache=True          (token-by-token 推理)
+    correct(MS, HQ_stu) -> HQ':  HQ'_i = HQ_stu_i + a*MS_i (广播逐元素).
     唯一可训练模块 (LLM 冻结).
     """
 
@@ -112,9 +120,10 @@ class TransMem(nn.Module):
         # 读出: 零初始化 -> 初始 MS=0 -> HQ'=HQ_stu 恒等
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
-        # learned 位置: 零初始化 -> 初始不扰动输入
+        # learned 位置: 零初始化 -> 初始不扰动输入 (覆盖 N 记忆槽 + max_queries 个 query 位)
         if config.pos_mode == "learned":
-            self.pos_emb = nn.Parameter(torch.zeros(1, config.n_mem + 1, dim))
+            self.pos_emb = nn.Parameter(
+                torch.zeros(1, config.n_mem + config.max_queries, dim))
         else:
             self.pos_emb = None
 
@@ -157,25 +166,49 @@ class TransMem(nn.Module):
             nn.init.zeros_(self.out_proj.weight)
 
     # ── 前向: X -> MS ─────────────────────────────────────────────────
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        """X: [B, N+1, dim] (末位为查询槽) -> MS: [B, dim]."""
+    def forward(self, X: torch.Tensor,
+                past_key_values=None,
+                use_cache: bool = False,
+                return_all_queries: bool = False) -> torch.Tensor:
+        """X: [B, S, dim] -> MS.
+
+        三种用法:
+          1) 默认: 一次前向, 读末位 -> [B, dim].
+             X=[HM; HQ_1..i] 时末位恰是当前查询 (rollout 无 cache 的朴素版).
+          2) return_all_queries=True: 读第 n_mem 位起的全部 query 位 -> [B, S-N, dim].
+             X=[HM; HQ_1..M] 一次并行前向, causal mask 保证位置 i 只见 {HM, HQ_1..i}
+             (训练侧 teacher-forcing 并行, 与逐步推理语义一致).
+          3) past_key_values=transformers DynamicCache, use_cache=True: 增量前向.
+             首次喂 [HM; HQ_1] prefill, 之后每步只喂当前 HQ_i [B,1,dim];
+             K/V 就地累积在 cache 里, 读末位 -> [B, dim] (token-by-token 推理).
+        """
         B, S, _ = X.shape
+        past_len = int(past_key_values.get_seq_length()) if past_key_values is not None else 0
+        if past_len > 0:
+            assert self.config.causal, "KV cache 增量前向要求 causal=True (双向注意力无法增量)"
+        assert not (return_all_queries and past_len > 0), \
+            "return_all_queries 是整段并行读出, 与增量 cache 不同时使用"
         h = X
 
-        # 位置 id: rope=0..S-1; none/learned=全 0(RoPE 退化为恒等旋转)
+        # 位置 id: rope=全局位置 past_len..past_len+S-1; none/learned=全 0(RoPE 恒等旋转)
         if self.config.pos_mode == "rope":
-            pos_ids = torch.arange(S, device=X.device, dtype=torch.long)
+            pos_ids = torch.arange(past_len, past_len + S, device=X.device, dtype=torch.long)
         else:
             pos_ids = torch.zeros(S, device=X.device, dtype=torch.long)
         pos_ids = pos_ids.unsqueeze(0).expand(B, -1)            # [B, S]
+        cache_position = torch.arange(past_len, past_len + S,
+                                      device=X.device, dtype=torch.long)
 
         if self.config.pos_mode == "learned":
-            assert S <= self.pos_emb.shape[1], (
-                f"learned 位置 embedding 长度 {self.pos_emb.shape[1]} < 序列 {S}")
-            h = h + self.pos_emb[:, :S, :].to(h.dtype)
+            end = past_len + S
+            assert end <= self.pos_emb.shape[1], (
+                f"learned 位置 embedding 长度 {self.pos_emb.shape[1]} < 序列 {end} "
+                f"(调大 config.max_queries)")
+            h = h + self.pos_emb[:, past_len:end, :].to(h.dtype)
 
         cos, sin = self.rotary(h, pos_ids)                      # [B, S, head_dim]
-        mask = build_additive_causal_mask(S, h.dtype, h.device, self.config.causal)
+        mask = build_additive_causal_mask(S, h.dtype, h.device, self.config.causal,
+                                          past_len=past_len)    # [1,1,S,past+S] | None
 
         for block in self.blocks:
             out = block(
@@ -183,17 +216,21 @@ class TransMem(nn.Module):
                 attention_mask=mask,
                 position_ids=pos_ids,
                 position_embeddings=(cos, sin),
-                use_cache=False,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
             )
             h = out[0] if isinstance(out, tuple) else out
 
         h = self.final_norm(h)
-        ms = self.out_proj(h[:, -1, :])                         # 读末位查询槽 [B, dim]
+        if return_all_queries:
+            return self.out_proj(h[:, self.config.n_mem:, :])   # 全部 query 位 [B, S-N, dim]
+        ms = self.out_proj(h[:, -1, :])                         # 读末位 = 当前查询 [B, dim]
         return ms
 
     # ── 读出: HQ' = HQ_stu + a*MS ────────────────────────────────────
     def correct(self, ms: torch.Tensor, hq_stu: torch.Tensor) -> torch.Tensor:
-        """HQ'_i = HQ_stu_i + a*MS_i.  ms, hq_stu: [B, dim]."""
+        """HQ'_i = HQ_stu_i + a*MS_i.  ms, hq_stu: [B, dim] 或 [B, M, dim] (逐元素)."""
         return hq_stu + self.a * ms
 
     @property

@@ -7,14 +7,16 @@ Stage 1 (on-policy / OPD) — 训练 TransMem: 在学生自己 rollout 的轨迹
   on-policy : 轨迹 = 当前策略 (冻结 LLM + TransMem) 在线采样的答案 A', 边训边采.
 散度计算共用 DistillLoss (法则第 4 条).
 
-每条样本:
-  1) no_grad 学生 rollout (TransMem 在环): prefill (C_L,Q) -> HM_stu + 逐步
-     HQ_stu_i = LLM 末位 hidden; X_i=[HM_stu;HQ_stu_i]; MS_i=TransMem(X_i);
-     HQ'_i=HQ_stu_i+a*MS_i; A'_i = sample(lm_head(HQ'_i)); 喂回 LLM (KV cache).
-     缓存 HM_stu, HQ_stu_i [AN,dim], 采样轨迹 A'.
+每条样本 (序列语义, docs/version2/transmem正常化修改意见.md):
+  1) no_grad 学生 rollout (TransMem 在环, 自己带 KV cache): prefill (C_L,Q) -> HM_stu;
+     TransMem 先吃 [HM_stu; HQ_stu_1] prefill 自己的 cache, 之后每步只喂新 HQ_stu_i —
+     位置 i 的查询因果地看到 {HM_1..N, HQ_1..i} 全部历史 (token-by-token, 与外层 LLM
+     的 past_key_values 平行地各持一份状态). MS_i -> HQ'_i=HQ_stu_i+a*MS_i ->
+     A'_i = sample(lm_head(HQ'_i)); 喂回 LLM. 缓存 HM_stu, HQ_stu_i [AN,dim], 轨迹 A'.
   2) no_grad 教师 teacher-forcing (C_S,Q,A'_[1:AN-1]) -> HQ_tea_i -> teacher_logits.
-  3) WITH grad: 用缓存的 (detach 的) HM_stu/HQ_stu_i 重算 MS_i -> HQ'_i -> student_logits,
-     loss = DistillLoss(P_tea, P_stu), 反传 (梯度只到 TransMem; 轨迹 token 离散视为固定).
+  3) WITH grad: 把缓存的 [HM_stu; HQ_stu_1..AN] 当一条 [1,N+AN,dim] 序列一次并行前向
+     (return_all_queries=True; causal mask 与 1) 的逐步语义一致) -> MS_1..AN -> HQ'
+     -> student_logits, loss = DistillLoss(P_tea, P_stu), 反传 (梯度只到 TransMem).
 
 LLM 全程冻结且仅 forward (no_grad), 唯一反传的是 TransMem. on-policy 蒸馏散度建议 reverse_kl / jsd.
 
@@ -37,6 +39,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from transformers.cache_utils import DynamicCache
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -116,7 +119,13 @@ class OnPolicyRollout:
     @torch.no_grad()
     def student_rollout(self, mem: TransMem, context_long: str, question: str,
                         max_new: int, sample: bool, temperature: float):
-        """学生在线 rollout (TransMem 在环). 返回 (HM_stu [N,dim], HQ_stu [AN,dim], A' ids)."""
+        """学生在线 rollout (TransMem 在环, token-by-token).
+
+        TransMem 与外层 LLM 各持一份 KV cache: 第 1 步喂 [HM_stu; HQ_stu_1] prefill,
+        之后每步只喂新 HQ_stu_i — 第 i 步查询因果地 attend {HM_1..N, HQ_1..i} 全部历史
+        (transmem正常化修改意见.md §3.1/3.2), 而非固定记忆 + 孤立当前查询.
+        返回 (HM_stu [N,dim], HQ_stu [AN,dim], A' ids).
+        """
         cq_ids = build_chat_prompt_ids(self.tok, context_long, question, self.device)
         len_cl = self.tok(context_long, return_tensors="pt",
                           add_special_tokens=False).input_ids.shape[1]
@@ -131,10 +140,11 @@ class OnPolicyRollout:
 
             hq_list, ans_ids = [], []
             hq_cur = prefill_hidden[-1:, :]                      # HQ_stu_1 [1,dim]
+            mem_past = DynamicCache()                            # TransMem 自己的 KV cache
+            X = torch.cat([hm_stu, hq_cur], dim=0).unsqueeze(0).to(self.dtype)  # [1,N+1,dim]
             for _ in range(max_new):
                 hq_list.append(hq_cur[0])
-                X = torch.cat([hm_stu, hq_cur], dim=0).unsqueeze(0).to(self.dtype)  # [1,N+1,dim]
-                ms = mem(X)                                      # [1, dim]
+                ms = mem(X, past_key_values=mem_past, use_cache=True)  # [1, dim] 读末位
                 hq_prime = hq_cur.to(ms.dtype) + mem.a * ms      # [1, dim]
                 logits = self.model.lm_head(hq_prime)            # [1, vocab]
                 if sample:
@@ -150,6 +160,7 @@ class OnPolicyRollout:
                                   use_cache=True)
                 past = step.past_key_values
                 hq_cur = store["h"][0][-1:, :]                   # HQ_stu_{i+1}
+                X = hq_cur.unsqueeze(0).to(self.dtype)           # 增量: 只喂新查询 [1,1,dim]
         finally:
             handle.remove()
 
@@ -263,11 +274,11 @@ class OnPolicyTrainer:
         teacher_logits = teacher_logits[:AN]
         hq_tea = hq_tea[:AN].detach().to(self.dtype)             # [AN, dim] (reg 目标)
 
-        # 3) WITH grad: 重算 MS -> HQ' -> student_logits, 反传到 TransMem
+        # 3) WITH grad: 整条 [HM; HQ_1..AN] 一次并行前向重算全部 MS (§3.3) —
+        #    causal mask 保证第 i 位只看 {HM, HQ_1..i}, 与 rollout 的逐步语义一致
         self.mem.train()
-        X = torch.cat([hm_stu.unsqueeze(0).expand(AN, -1, -1),
-                       hq_stu.unsqueeze(1)], dim=1)              # [AN, N+1, dim]
-        ms = self.mem(X)                                        # [AN, dim]
+        X = torch.cat([hm_stu, hq_stu], dim=0).unsqueeze(0)      # [1, N+AN, dim] 一条序列
+        ms = self.mem(X, return_all_queries=True).squeeze(0)     # [AN, dim]
         hq_prime = hq_stu + self.mem.a * ms
         student_logits = self.lm_head(hq_prime)                 # [AN, vocab]
         loss, metrics = self.loss_fn(student_logits, teacher_logits, hq_prime, hq_tea)

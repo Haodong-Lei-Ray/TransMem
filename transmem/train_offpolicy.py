@@ -3,12 +3,21 @@
 Stage 1 (off-policy) — 训练 TransMem: 逐位置蒸馏, 穿冻结 lm_head 反传到 TransMem.
 
 数据来源 = Stage0 固定教师轨迹的特征 (off-policy: 轨迹由教师 rollout 给定, 与当前策略无关).
-  X_i           = [HM_stu ; HQ_stu_i]            [B, N+1, dim]
-  MS_i          = TransMem(X_i)                   [B, dim]
+
+序列语义 (docs/version2/transmem正常化修改意见.md §2.3, 用户确认必做): 每条样本是
+一整条有序序列, 不再摊平成 i.i.d. 位置池 — 位置 i 的 query 因果地看到同样本更早的
+query, 与 token-by-token 推理一致.
+  X             = [HM_stu ; HQ_stu_1..M]          [B, N+M_max, dim]  (批内右 padding)
+  MS_1..M       = TransMem(X, return_all_queries) [B, M_max, dim]    (causal 并行前向)
   HQ'_i         = HQ_stu_i + a*MS_i
-  student_logits= lm_head(HQ'_i)                  (冻结 lm_head, 可微)
-  teacher_logits= lm_head(HQ_tea_i)               (固定软目标)
+  按 q_mask 收集有效位 (padding 不进 loss):
+  student_logits= lm_head(HQ'[q_mask])            (冻结 lm_head, 可微)
+  teacher_logits= lm_head(HQ_tea[q_mask])         (固定软目标)
   L             = DistillLoss(P_tea, P_stu)       (forward_kl / reverse_kl / jsd; +可选 L_reg)
+
+causal mask 下尾部 padding 严格不影响有效位输出 (test_shapes [8]), 故 attention 内
+无需 padding mask, 只要 loss 端按 q_mask 过滤. batch_size 现在数的是**序列条数**
+(每条贡献 M 个位置), 不再是位置数.
 
 只反传 lm_head 这一个线性层, 不重跑整个 LLM -> 很轻. Stage0 已离线算好特征, 训练全程不碰 LLM.
 
@@ -17,7 +26,7 @@ Stage 1 (off-policy) — 训练 TransMem: 逐位置蒸馏, 穿冻结 lm_head 反
     --data_dir data/stage0_train --val_data_dir data/stage0_dev \
     --config transmem/config.json --output_dir checkpoints/offpolicy \
     --divergence forward_kl --temperature 1.0 --reg_weight 0.0 \
-    --batch_size 128 --lr 1e-4 --epochs 30
+    --batch_size 16 --lr 1e-4 --epochs 30
 """
 
 from __future__ import annotations
@@ -61,7 +70,8 @@ def parse_args():
     p.add_argument("--jsd_beta", type=float, default=0.5)
     # 训练
     p.add_argument("--output_dir", default="checkpoints/offpolicy")
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=16,
+                   help="每批**序列条数** (每条含 M 个位置, avg M~25), 不是位置数")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--epochs", type=int, default=30)
@@ -81,15 +91,18 @@ def parse_args():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Dataset: 预载入 Stage0 特征, __getitem__ 返回 (X=[hm;hq_stu], hq_tea)
+# Dataset: 预载入 Stage0 特征, __getitem__ 按样本返回完整有序序列
 # ═══════════════════════════════════════════════════════════════════════════
 
 class OffPolicyDataset(Dataset):
-    """全量预载入内存的逐位置数据集.
+    """全量预载入内存的**按样本序列**数据集 (一条 = 一个样本的完整有序轨迹).
 
-    Stage0 每样本存 hm_stu [N,dim], hq_stu [M,dim], hq_tea [M,dim].
-    预载入摊平成: cond_mem [num_samples,N,dim], hq_stu_flat/hq_tea_flat [total_pairs,dim].
-    __getitem__ 纯内存切片, 训练不再触盘 (复用 DiffusionMem Stage0Dataset 思路).
+    Stage0 每样本存 hm_stu [N,dim], hq_stu [M,dim], hq_tea [M,dim] (组内顺序即生成顺序).
+    存储仍用扁平大张量 (省碎片): cond_mem [num_samples,N,dim],
+    hq_stu_flat/hq_tea_flat [total_pairs,dim] + 每样本 (offset, M).
+    __getitem__ 返回 (hm [N,dim], hq_stu [M,dim], hq_tea [M,dim]) — 保留组内顺序,
+    TransMem 因果注意力才能让 query i 看到同样本更早的 query (与推理语义一致).
+    变长 M 由 collate_sequences 右 padding + q_mask 处理.
     """
 
     def __init__(self, data_dir: str, load_dtype: torch.dtype = torch.float32):
@@ -109,12 +122,13 @@ class OffPolicyDataset(Dataset):
         if total_pairs == 0:
             raise RuntimeError(f"Stage0 数据 total_pairs=0: {self.data_dir}")
 
-        print(f"OffPolicyDataset: 预载入 {num_samples} 样本 / {total_pairs} 对 "
+        print(f"OffPolicyDataset: 预载入 {num_samples} 样本 / {total_pairs} 位置 "
               f"({store_dtype}) from {self.data_dir} ...")
         self.cond_mem = torch.empty(num_samples, self.N, self.dim, dtype=store_dtype)
         self.hq_stu_flat = torch.empty(total_pairs, self.dim, dtype=store_dtype)
         self.hq_tea_flat = torch.empty(total_pairs, self.dim, dtype=store_dtype)
-        self.pair_to_sample = torch.empty(total_pairs, dtype=torch.long)
+        self.sample_offset = torch.empty(num_samples, dtype=torch.long)
+        self.sample_len = torch.empty(num_samples, dtype=torch.long)
 
         cursor = 0
         for s, entry in enumerate(manifest):
@@ -124,25 +138,46 @@ class OffPolicyDataset(Dataset):
             self.cond_mem[s] = data["hm_stu"].to(store_dtype)
             self.hq_stu_flat[cursor:cursor + M] = data["hq_stu"].to(store_dtype)
             self.hq_tea_flat[cursor:cursor + M] = data["hq_tea"].to(store_dtype)
-            self.pair_to_sample[cursor:cursor + M] = s
+            self.sample_offset[s] = cursor
+            self.sample_len[s] = M
             cursor += M
             if (s + 1) % 5000 == 0:
                 print(f"  ...已载入 {s + 1}/{num_samples}")
         assert cursor == total_pairs, (cursor, total_pairs)
         self.total_pairs = total_pairs
         self.num_samples = num_samples
-        print(f"OffPolicyDataset: 完成, avg M={total_pairs / num_samples:.1f}")
+        print(f"OffPolicyDataset: 完成, avg M={total_pairs / num_samples:.1f}, "
+              f"max M={int(self.sample_len.max())}")
 
     def __len__(self):
-        return self.total_pairs
+        return self.num_samples
 
-    def __getitem__(self, flat_idx: int):
-        s = int(self.pair_to_sample[flat_idx])
-        hm_stu = self.cond_mem[s].to(self.load_dtype)            # [N, dim]
-        hq_stu = self.hq_stu_flat[flat_idx].to(self.load_dtype)  # [dim]
-        hq_tea = self.hq_tea_flat[flat_idx].to(self.load_dtype)  # [dim]
-        X = torch.cat([hm_stu, hq_stu.unsqueeze(0)], dim=0)      # [N+1, dim] (查询槽末尾)
-        return X, hq_tea
+    def __getitem__(self, idx: int):
+        o, M = int(self.sample_offset[idx]), int(self.sample_len[idx])
+        hm_stu = self.cond_mem[idx].to(self.load_dtype)          # [N, dim]
+        hq_stu = self.hq_stu_flat[o:o + M].to(self.load_dtype)   # [M, dim] 有序
+        hq_tea = self.hq_tea_flat[o:o + M].to(self.load_dtype)   # [M, dim] 有序
+        return hm_stu, hq_stu, hq_tea
+
+
+def collate_sequences(batch):
+    """右 padding 到批内最长 M -> (X [B,N+M_max,dim], hq_tea [B,M_max,dim], q_mask [B,M_max]).
+
+    causal mask 下有效位看不到尾部 padding (test_shapes [8] 已验证), attention 内
+    无需额外 mask; padding 位的输出是垃圾, 由 q_mask 挡在 loss 之外.
+    """
+    hm = torch.stack([b[0] for b in batch], dim=0)               # [B, N, dim]
+    lens = [b[1].shape[0] for b in batch]
+    B, m_max, dim = len(batch), max(lens), hm.shape[-1]
+    hq_stu = hm.new_zeros(B, m_max, dim)
+    hq_tea = hm.new_zeros(B, m_max, dim)
+    q_mask = torch.zeros(B, m_max, dtype=torch.bool)
+    for i, (_, s, t) in enumerate(batch):
+        hq_stu[i, :lens[i]] = s
+        hq_tea[i, :lens[i]] = t
+        q_mask[i, :lens[i]] = True
+    X = torch.cat([hm, hq_stu], dim=1)                           # [B, N+M_max, dim]
+    return X, hq_tea, q_mask
 
 
 def make_dataloader(data_dir, batch_size, num_workers, dtype, shuffle=True):
@@ -150,7 +185,7 @@ def make_dataloader(data_dir, batch_size, num_workers, dtype, shuffle=True):
     sampler = (torch.utils.data.RandomSampler(ds, num_samples=len(ds), replacement=False)
                if shuffle else torch.utils.data.SequentialSampler(ds))
     return DataLoader(ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
-                      pin_memory=True, drop_last=True,
+                      pin_memory=True, drop_last=True, collate_fn=collate_sequences,
                       persistent_workers=(num_workers > 0))
 
 
@@ -165,6 +200,9 @@ class OffPolicyTrainer:
         self.train_dtype = _DTYPE[args.dtype]
 
         self.config = TransMemConfig.from_json(args.config)
+        assert self.config.causal, (
+            "序列级 off-policy 训练依赖 causal mask (尾部 padding 不可见 + "
+            "query 只看历史); causal=false 与 token-by-token 推理语义不兼容")
         self.mem = TransMem(self.config).to(self.device, dtype=self.train_dtype)
         if self.config.warm_start:
             self._warm_start()
@@ -190,6 +228,8 @@ class OffPolicyTrainer:
             lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
         self.global_step = 0
         self.epoch = 0
+        self.best_val = float("inf")   # 最优 val_loss, 独立持久化到 result.json (resume 不重置)
+        self.best_step = -1
         self.writer = SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
 
     def _warm_start(self):
@@ -214,35 +254,43 @@ class OffPolicyTrainer:
         for g in self.optimizer.param_groups:
             g["lr"] = lr
 
-    def compute_loss(self, X, hq_tea, full: bool = False):
-        """X [B,N+1,dim], hq_tea [B,dim] -> (loss, metrics).
+    def compute_loss(self, X, hq_tea, q_mask, full: bool = False):
+        """X [B,N+M,dim], hq_tea [B,M,dim], q_mask [B,M] -> (loss, metrics).
 
+        一次并行前向算全部 query 位 MS (causal mask: 位置 i 只见 {HM, HQ_1..i}),
+        再按 q_mask 收集有效位算散度 —— padding 位不进 loss (= masked loss).
         full=True 时额外算 baseline(MS=0)散度与改善比 (多一次 lm_head, 只在 log/val 步用).
         ms_norm / top1 恒算 (近乎零成本).
         """
-        hq_stu = X[:, -1, :]                       # 查询槽 = 末位
-        ms = self.mem(X)
-        hq_prime = self.mem.correct(ms, hq_stu)
-        student_logits = self.lm_head(hq_prime)
+        N = self.mem.config.n_mem
+        hq_stu = X[:, N:, :]                                     # [B, M, dim] 全部 query 位
+        ms = self.mem(X, return_all_queries=True)                # [B, M, dim]
+        hq_prime = self.mem.correct(ms, hq_stu)                  # [B, M, dim]
+
+        valid = q_mask.to(X.device)                              # [B, M] bool
+        hq_prime_v = hq_prime[valid]                             # [P, dim] 有效位
+        hq_tea_v = hq_tea[valid]                                 # [P, dim]
+        student_logits = self.lm_head(hq_prime_v)                # [P, vocab]
         with torch.no_grad():
-            teacher_logits = self.lm_head(hq_tea)
-        loss, metrics = self.loss_fn(student_logits, teacher_logits, hq_prime, hq_tea)
+            teacher_logits = self.lm_head(hq_tea_v)
+        loss, metrics = self.loss_fn(student_logits, teacher_logits, hq_prime_v, hq_tea_v)
+        metrics["positions"] = int(valid.sum())
 
         # ── 诊断量 (不进 loss, 纯监控) ──────────────────────────────────
         with torch.no_grad():
-            metrics["ms_norm"] = float(ms.norm(dim=-1).mean())   # 记忆偏置强度: 0->涨->稳
+            metrics["ms_norm"] = float(ms[valid].norm(dim=-1).mean())  # 记忆偏置强度: 0->涨->稳
             metrics["top1"] = float(                             # 纠正后学生与教师 argmax 一致率
                 (student_logits.argmax(-1) == teacher_logits.argmax(-1)).float().mean())
             if full:
-                base_logits = self.lm_head(hq_stu)               # MS=0 未纠正的学生
+                base_logits = self.lm_head(hq_stu[valid])        # MS=0 未纠正的学生
                 bd = float(self.loss_fn.divergence_only(base_logits, teacher_logits))
                 metrics["base_div"] = bd                         # 初始 gap (student(C_L) vs teacher(C_S))
                 metrics["improve"] = ((bd - metrics["div"]) / bd) if bd > 1e-8 else 0.0
         return loss, metrics
 
-    def train_step(self, X, hq_tea, full: bool = False):
+    def train_step(self, X, hq_tea, q_mask, full: bool = False):
         self.mem.train()
-        loss, metrics = self.compute_loss(X, hq_tea, full=full)
+        loss, metrics = self.compute_loss(X, hq_tea, q_mask, full=full)
         self.optimizer.zero_grad()
         loss.backward()
         if self.args.grad_clip > 0:
@@ -256,10 +304,10 @@ class OffPolicyTrainer:
         self.mem.eval()
         agg = {"val_loss": 0.0, "val_top1": 0.0, "val_improve": 0.0}
         n = 0
-        for X, hq_tea in dataloader:
+        for X, hq_tea, q_mask in dataloader:
             X = X.to(self.device)
             hq_tea = hq_tea.to(self.device)
-            _, m = self.compute_loss(X, hq_tea, full=True)
+            _, m = self.compute_loss(X, hq_tea, q_mask, full=True)
             agg["val_loss"] += m["loss"]
             agg["val_top1"] += m["top1"]
             agg["val_improve"] += m.get("improve", 0.0)
@@ -286,7 +334,35 @@ class OffPolicyTrainer:
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.global_step = ckpt.get("global_step", 0)
         self.epoch = ckpt.get("epoch", 0)
-        print(f"Resumed: step={self.global_step}")
+        self._load_result()   # 恢复 best_val, 避免 resume 后覆盖历史最优
+        print(f"Resumed: step={self.global_step}, best_val={self.best_val:.6f}")
+
+    def _result_path(self):
+        return Path(self.args.output_dir) / "result.json"
+
+    def _load_result(self):
+        """从 result.json 恢复 best_val/best_step (独立于 .pt checkpoint)."""
+        p = self._result_path()
+        if p.exists():
+            try:
+                r = json.loads(p.read_text())
+                self.best_val = r.get("best_val", float("inf"))
+                self.best_step = r.get("best_step", -1)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"  警告: 读取 {p} 失败 ({e}), best_val 保持 {self.best_val}")
+
+    def _save_result(self, extra=None):
+        """把训练进度 + 最优结果落盘到 result.json (原子写)."""
+        r = {"best_val": self.best_val, "best_step": self.best_step,
+             "global_step": self.global_step, "epoch": self.epoch,
+             "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
+        if extra:
+            r.update(extra)
+        p = self._result_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(r, indent=2, ensure_ascii=False))
+        tmp.replace(p)   # 同目录 rename, 原子替换, 防止写一半的损坏文件
 
     def run(self):
         args = self.args
@@ -295,16 +371,21 @@ class OffPolicyTrainer:
         val_dl = (make_dataloader(args.val_data_dir, args.batch_size, args.num_workers,
                                   self.train_dtype, shuffle=False)
                   if args.val_data_dir else None)
+        assert train_dl.dataset.N == self.config.n_mem, (
+            f"Stage0 数据 N={train_dl.dataset.N} != config n_mem={self.config.n_mem}: "
+            f"forward 里 query 槽从第 n_mem 位切, 不一致会静默错位")
         total_steps = args.max_steps or (args.epochs * len(train_dl))
         print(f"\n训练: steps/epoch≈{len(train_dl)}, total≈{total_steps}, "
-              f"bs={args.batch_size}, lr={args.lr}, device={self.device}")
+              f"bs={args.batch_size} 序列/批 (avg "
+              f"{train_dl.dataset.total_pairs / train_dl.dataset.num_samples:.1f} 位置/序列), "
+              f"lr={args.lr}, device={self.device}")
         print("=" * 72)
 
         if args.overfit_batch:
-            X, hq_tea = next(iter(train_dl))
+            X, hq_tea, q_mask = next(iter(train_dl))
             X, hq_tea = X.to(self.device), hq_tea.to(self.device)
             for step in range(500):
-                m = self.train_step(X, hq_tea, full=(step % 50 == 0))
+                m = self.train_step(X, hq_tea, q_mask, full=(step % 50 == 0))
                 self.writer.add_scalar("train/loss", m["loss"], step)
                 self.writer.add_scalar("train/div", m["div"], step)
                 self.writer.add_scalar("train/ms_norm", m["ms_norm"], step)
@@ -318,19 +399,18 @@ class OffPolicyTrainer:
             self.writer.close()
             return
 
-        best_val = float("inf")
         running = 0.0
         t0 = time.time()
         while self.global_step < total_steps:
             self.epoch += 1
-            for X, hq_tea in train_dl:
+            for X, hq_tea, q_mask in train_dl:
                 if self.global_step >= total_steps:
                     break
                 self._set_lr(self.global_step, total_steps)
                 X, hq_tea = X.to(self.device), hq_tea.to(self.device)
                 # 该步过后若触发 log, 就算上 baseline 诊断 (base_div/improve)
                 full = ((self.global_step + 1) % args.log_interval == 0)
-                m = self.train_step(X, hq_tea, full=full)
+                m = self.train_step(X, hq_tea, q_mask, full=full)
                 self.global_step += 1
                 running += m["loss"]
                 if self.global_step % args.log_interval == 0:
@@ -366,13 +446,16 @@ class OffPolicyTrainer:
                     self.writer.add_scalar("val/loss", vm["val_loss"], self.global_step)
                     self.writer.add_scalar("val/top1", vm["val_top1"], self.global_step)
                     self.writer.add_scalar("val/improve", vm["val_improve"], self.global_step)
-                    if vm["val_loss"] < best_val:
-                        best_val = vm["val_loss"]
-                        self.save(args.output_dir, {"val_loss": best_val, "best": True})
+                    if vm["val_loss"] < self.best_val:
+                        self.best_val = vm["val_loss"]
+                        self.best_step = self.global_step
+                        self.save(args.output_dir, {"val_loss": self.best_val, "best": True})
+                        self._save_result({"best_metrics": vm})
                 if self.global_step % args.save_interval == 0:
                     self.save(args.output_dir)
         final = self.validate(val_dl, max_batches=200) if val_dl else {}
         self.save(args.output_dir, final)
+        self._save_result({"final_metrics": final, "done": True})
         self.writer.close()
         print("=" * 72)
         print(f"✅ off-policy 训练完成: {self.global_step} steps"

@@ -120,9 +120,91 @@ def test_param_count():
     print(f"    small: {mem.num_params():,} (trainable {mem.num_params(True):,})")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 序列语义 (docs/version2/transmem正常化修改意见.md §5): 因果依赖 / KV cache /
+# padding 不变性 —— 钉死 "query i 看 {HM, HQ_1..i}" 与 token-by-token 推理一致
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_all_queries_causality():
+    """return_all_queries: 扰动 HQ_1 -> 全部 MS 变; 扰动 HQ_M -> 只 MS_M 变 (因果)."""
+    print("[6] return_all_queries 因果依赖")
+    torch.manual_seed(1)
+    cfg = _small_cfg(zero_init_out=False)
+    mem = TransMem(cfg).eval()
+    B, N, M, D = 2, cfg.n_mem, 5, cfg.dim
+    X = torch.randn(B, N + M, D)
+    with torch.no_grad():
+        ms_all = mem(X, return_all_queries=True)                 # [B, M, D]
+        assert ms_all.shape == (B, M, D), ms_all.shape
+        # 默认读末位 == 并行读出的最后一个 query 位
+        ms_last = mem(X)
+        assert torch.allclose(ms_last, ms_all[:, -1, :], atol=1e-5), "末位读出不一致"
+        # 扰动第一个 query: 它自己和所有后续 query 都能看到它 -> 全变
+        X1 = X.clone(); X1[:, N, :] += 1.0
+        ms1 = mem(X1, return_all_queries=True)
+        assert not torch.allclose(ms1, ms_all, atol=1e-4), "扰动 HQ_1 后 MS 未变"
+        assert (ms1 - ms_all).abs().amax(dim=(0, 2)).min() > 1e-6, \
+            "扰动 HQ_1 后存在完全不变的后续 MS (历史没被看到)"
+        # 扰动最后一个 query: 前面的 query 看不到未来 -> MS_1..M-1 不变
+        X2 = X.clone(); X2[:, -1, :] += 1.0
+        ms2 = mem(X2, return_all_queries=True)
+        assert torch.allclose(ms2[:, :-1, :], ms_all[:, :-1, :], atol=1e-5), \
+            "扰动 HQ_M 影响了更早的 MS (因果泄漏!)"
+        assert not torch.allclose(ms2[:, -1, :], ms_all[:, -1, :], atol=1e-4), \
+            "扰动 HQ_M 后 MS_M 未变"
+    # 零初始化: 任意序列长下 MS 恒为 0 (恒等启动与历史长度无关)
+    mem0 = TransMem(_small_cfg(zero_init_out=True)).eval()
+    with torch.no_grad():
+        ms0 = mem0(X, return_all_queries=True)
+    assert torch.allclose(ms0, torch.zeros_like(ms0), atol=1e-6), "零初始化下 MS != 0"
+    print("    HQ_1 全传播 / HQ_M 无泄漏 / 末位一致 / 零初始化恒等  OK")
+
+
+def test_kv_cache_matches_full():
+    """增量 KV cache 前向 (prefill [HM;HQ_1] + 逐 token) == 整段并行前向."""
+    print("[7] KV cache 增量 == 整段并行")
+    from transformers.cache_utils import DynamicCache
+    torch.manual_seed(2)
+    for pos in ("none", "rope", "learned"):
+        cfg = _small_cfg(zero_init_out=False, pos_mode=pos)
+        mem = TransMem(cfg).eval()
+        N, M, D = cfg.n_mem, 6, cfg.dim
+        X = torch.randn(1, N + M, D)
+        with torch.no_grad():
+            full = mem(X, return_all_queries=True)               # [1, M, D]
+            past = DynamicCache()
+            steps = [mem(X[:, :N + 1, :], past_key_values=past, use_cache=True)]
+            for i in range(1, M):
+                steps.append(mem(X[:, N + i:N + i + 1, :],
+                                 past_key_values=past, use_cache=True))
+            inc = torch.stack(steps, dim=1)                      # [1, M, D]
+        err = (inc - full).abs().max().item()
+        assert torch.allclose(inc, full, atol=1e-4, rtol=1e-4), \
+            f"pos={pos}: KV cache 与并行前向不一致 (max_err={err:.2e})"
+        print(f"    pos={pos:7s}: max_err={err:.2e}  OK")
+
+
+def test_trailing_padding_invariance():
+    """causal mask 下尾部 padding 不影响有效 query 位 (off-policy 批内变长的前提)."""
+    print("[8] 尾部 padding 不变性")
+    torch.manual_seed(3)
+    cfg = _small_cfg(zero_init_out=False)
+    mem = TransMem(cfg).eval()
+    N, M, P, D = cfg.n_mem, 4, 3, cfg.dim
+    X = torch.randn(1, N + M, D)
+    X_pad = torch.cat([X, torch.randn(1, P, D)], dim=1)          # 尾部垫 P 个垃圾位
+    with torch.no_grad():
+        ms = mem(X, return_all_queries=True)                     # [1, M, D]
+        ms_pad = mem(X_pad, return_all_queries=True)[:, :M, :]   # 取前 M 个有效位
+    err = (ms_pad - ms).abs().max().item()
+    assert torch.allclose(ms_pad, ms, atol=1e-5), \
+        f"尾部 padding 改变了有效位输出 (max_err={err:.2e}) — causal mask 失效?"
+    print(f"    max_err={err:.2e}  OK")
+
+
 def test_real_config():
     """加载真实 config.json (dim=2560) 构建并前向一次, 验证配置可用."""
-    print("[6] 真实 config.json 构建 + 前向 (dim=2560)")
+    print("[9] 真实 config.json 构建 + 前向 (dim=2560)")
     cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
     cfg = TransMemConfig.from_json(cfg_path)
     cfg.attn_impl = "eager"   # CPU
@@ -148,6 +230,9 @@ def main():
     test_pos_modes_and_mask()
     test_distill_loss()
     test_param_count()
+    test_all_queries_causality()
+    test_kv_cache_matches_full()
+    test_trailing_padding_invariance()
     if not args.skip_real:
         test_real_config()
     print("=" * 60)

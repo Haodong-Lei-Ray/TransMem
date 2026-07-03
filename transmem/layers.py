@@ -75,11 +75,13 @@ def to_qwen3_config(cfg) -> Qwen3Config:
 
 def build_additive_causal_mask(seq_len: int, dtype: torch.dtype,
                                device: torch.device,
-                               causal: bool = True) -> Optional[torch.Tensor]:
-    """构造 [1, 1, S, S] 加性 attention mask.
+                               causal: bool = True,
+                               past_len: int = 0) -> Optional[torch.Tensor]:
+    """构造 [1, 1, S, past_len+S] 加性 attention mask (S=本次新喂入的长度).
 
-    causal=True : 上三角(未来位置)填 dtype 最小值, 其余 0 -> 标准因果.
-                  查询在末尾 -> 能看到前面所有记忆 + 自己.
+    causal=True : 全局位置 past_len+i 的查询只能看 key 0..past_len+i -> 标准因果.
+                  past_len=0 时退化为原来的 [1,1,S,S] 方阵; past_len>0 用于 KV cache
+                  增量前向 (cache 里的历史 key 全可见, 新 token 间仍因果).
     causal=False: 返回 None -> Qwen3Attention 走全可见(记忆槽间双向).
 
     用 finfo(dtype).min 而非 -inf, 避免 bf16/half 下 sdpa/eager 的 NaN 风险
@@ -87,10 +89,11 @@ def build_additive_causal_mask(seq_len: int, dtype: torch.dtype,
     """
     if not causal:
         return None
+    total = past_len + seq_len
     min_val = torch.finfo(dtype).min
-    mask = torch.full((seq_len, seq_len), min_val, dtype=dtype, device=device)
-    mask = torch.triu(mask, diagonal=1)        # j>i 屏蔽(未来), 其余 0
-    return mask.view(1, 1, seq_len, seq_len)
+    mask = torch.full((seq_len, total), min_val, dtype=dtype, device=device)
+    mask = torch.triu(mask, diagonal=1 + past_len)   # j > past_len+i 屏蔽(未来), 其余 0
+    return mask.view(1, 1, seq_len, total)
 
 
 # ═══════════════════════════════════════════════════════════════════════
