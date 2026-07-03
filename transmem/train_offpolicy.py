@@ -40,7 +40,9 @@ import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,6 +50,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from transmem import TransMemConfig, TransMem, DistillLoss, FrozenLMHead
 
 _DTYPE = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+
+
+def setup_distributed():
+    """torchrun 启动时 (WORLD_SIZE>1) 初始化 DDP; 普通单进程启动完全不受影响.
+
+    返回 (rank, world_size, local_rank). backend: GPU 用 nccl, CPU 冒烟用 gloo.
+    """
+    if int(os.environ.get("WORLD_SIZE", "1")) <= 1:
+        return 0, 1, 0
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+    return dist.get_rank(), dist.get_world_size(), int(os.environ.get("LOCAL_RANK", "0"))
 
 
 def parse_args():
@@ -180,10 +194,16 @@ def collate_sequences(batch):
     return X, hq_tea, q_mask
 
 
-def make_dataloader(data_dir, batch_size, num_workers, dtype, shuffle=True):
+def make_dataloader(data_dir, batch_size, num_workers, dtype, shuffle=True,
+                    distributed=False):
     ds = OffPolicyDataset(data_dir, load_dtype=dtype)
-    sampler = (torch.utils.data.RandomSampler(ds, num_samples=len(ds), replacement=False)
-               if shuffle else torch.utils.data.SequentialSampler(ds))
+    if distributed:
+        # 各 rank 分到不重叠的样本子集; 每 epoch 需 sampler.set_epoch 重洗
+        sampler = DistributedSampler(ds, shuffle=shuffle, drop_last=True)
+    elif shuffle:
+        sampler = torch.utils.data.RandomSampler(ds, num_samples=len(ds), replacement=False)
+    else:
+        sampler = torch.utils.data.SequentialSampler(ds)
     return DataLoader(ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
                       pin_memory=True, drop_last=True, collate_fn=collate_sequences,
                       persistent_workers=(num_workers > 0))
@@ -196,6 +216,12 @@ def make_dataloader(data_dir, batch_size, num_workers, dtype, shuffle=True):
 class OffPolicyTrainer:
     def __init__(self, args):
         self.args = args
+        # ── DDP: torchrun 启动时每 rank 一卡; rank0 独占 log/TB/val/save ──
+        self.rank, self.world, local_rank = setup_distributed()
+        self.is_main = (self.rank == 0)
+        if self.world > 1 and torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            args.device = f"cuda:{local_rank}"
         self.device = torch.device(args.device)
         self.train_dtype = _DTYPE[args.dtype]
 
@@ -206,6 +232,15 @@ class OffPolicyTrainer:
         self.mem = TransMem(self.config).to(self.device, dtype=self.train_dtype)
         if self.config.warm_start:
             self._warm_start()
+        # DDP wrap: 梯度 allreduce 用 self.net; state_dict/clip/correct 仍走裸 self.mem.
+        # broadcast_buffers=False: 唯一 buffer 是常量 a, 且避免 rank0 单独 no_grad
+        # 前向 (validate) 时其它 rank 卡在 buffer 广播上死锁.
+        if self.world > 1:
+            self.net = DDP(self.mem,
+                           device_ids=[local_rank] if torch.cuda.is_available() else None,
+                           broadcast_buffers=False)
+        else:
+            self.net = self.mem
 
         # 冻结 lm_head
         lm_path = args.lm_head_path or str(Path(args.data_dir) / "lm_head.pt")
@@ -214,14 +249,16 @@ class OffPolicyTrainer:
         self.loss_fn = DistillLoss(divergence=args.divergence, temperature=args.temperature,
                                    reg_weight=args.reg_weight, jsd_beta=args.jsd_beta)
 
-        print(f"TransMem: {self.mem.num_params():,} params "
-              f"({self.mem.num_params(True):,} trainable)")
-        print(f"Config: depth={self.config.depth}, heads={self.config.num_heads}, "
-              f"kv={self.config.num_kv_heads}, dim={self.config.dim}, "
-              f"pos={self.config.pos_mode}, causal={self.config.causal}, "
-              f"a={self.config.a_init}, warm_start={self.config.warm_start}")
-        print(f"Loss: {args.divergence}, T={args.temperature}, reg_weight={args.reg_weight}")
-        print(f"lm_head: vocab={self.lm_head.proj.out_features}")
+        if self.is_main:
+            print(f"TransMem: {self.mem.num_params():,} params "
+                  f"({self.mem.num_params(True):,} trainable)"
+                  + (f" | DDP x{self.world}" if self.world > 1 else ""))
+            print(f"Config: depth={self.config.depth}, heads={self.config.num_heads}, "
+                  f"kv={self.config.num_kv_heads}, dim={self.config.dim}, "
+                  f"pos={self.config.pos_mode}, causal={self.config.causal}, "
+                  f"a={self.config.a_init}, warm_start={self.config.warm_start}")
+            print(f"Loss: {args.divergence}, T={args.temperature}, reg_weight={args.reg_weight}")
+            print(f"lm_head: vocab={self.lm_head.proj.out_features}")
 
         self.optimizer = torch.optim.AdamW(
             (p for p in self.mem.parameters() if p.requires_grad),
@@ -230,7 +267,8 @@ class OffPolicyTrainer:
         self.epoch = 0
         self.best_val = float("inf")   # 最优 val_loss, 独立持久化到 result.json (resume 不重置)
         self.best_step = -1
-        self.writer = SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
+        self.writer = (SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
+                       if self.is_main else None)
 
     def _warm_start(self):
         if not self.args.model_path:
@@ -264,7 +302,10 @@ class OffPolicyTrainer:
         """
         N = self.mem.config.n_mem
         hq_stu = X[:, N:, :]                                     # [B, M, dim] 全部 query 位
-        ms = self.mem(X, return_all_queries=True)                # [B, M, dim]
+        # 训练走 DDP wrapper (梯度 allreduce); no_grad (validate/诊断) 走裸模块,
+        # 避免 rank0 单独 validate 时其它 rank 等不到集合通信而死锁
+        net = self.net if torch.is_grad_enabled() else self.mem
+        ms = net(X, return_all_queries=True)                     # [B, M, dim]
         hq_prime = self.mem.correct(ms, hq_stu)                  # [B, M, dim]
 
         valid = q_mask.to(X.device)                              # [B, M] bool
@@ -289,7 +330,7 @@ class OffPolicyTrainer:
         return loss, metrics
 
     def train_step(self, X, hq_tea, q_mask, full: bool = False):
-        self.mem.train()
+        self.net.train()
         loss, metrics = self.compute_loss(X, hq_tea, q_mask, full=full)
         self.optimizer.zero_grad()
         loss.backward()
@@ -317,6 +358,8 @@ class OffPolicyTrainer:
         return {k: v / max(n, 1) for k, v in agg.items()}
 
     def save(self, path, metrics=None):
+        if not self.is_main:
+            return
         Path(path).mkdir(parents=True, exist_ok=True)
         ckpt = {"model_state_dict": self.mem.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
@@ -335,7 +378,8 @@ class OffPolicyTrainer:
         self.global_step = ckpt.get("global_step", 0)
         self.epoch = ckpt.get("epoch", 0)
         self._load_result()   # 恢复 best_val, 避免 resume 后覆盖历史最优
-        print(f"Resumed: step={self.global_step}, best_val={self.best_val:.6f}")
+        if self.is_main:
+            print(f"Resumed: step={self.global_step}, best_val={self.best_val:.6f}")
 
     def _result_path(self):
         return Path(self.args.output_dir) / "result.json"
@@ -352,7 +396,9 @@ class OffPolicyTrainer:
                 print(f"  警告: 读取 {p} 失败 ({e}), best_val 保持 {self.best_val}")
 
     def _save_result(self, extra=None):
-        """把训练进度 + 最优结果落盘到 result.json (原子写)."""
+        """把训练进度 + 最优结果落盘到 result.json (原子写). 仅 rank0."""
+        if not self.is_main:
+            return
         r = {"best_val": self.best_val, "best_step": self.best_step,
              "global_step": self.global_step, "epoch": self.epoch,
              "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -367,42 +413,50 @@ class OffPolicyTrainer:
     def run(self):
         args = self.args
         train_dl = make_dataloader(args.data_dir, args.batch_size, args.num_workers,
-                                   self.train_dtype, shuffle=True)
+                                   self.train_dtype, shuffle=True,
+                                   distributed=(self.world > 1))
+        # 验证只在 rank0 做 (裸模块前向, 无集合通信; 其余 rank 在下个 backward 处等它)
         val_dl = (make_dataloader(args.val_data_dir, args.batch_size, args.num_workers,
                                   self.train_dtype, shuffle=False)
-                  if args.val_data_dir else None)
+                  if (args.val_data_dir and self.is_main) else None)
         assert train_dl.dataset.N == self.config.n_mem, (
             f"Stage0 数据 N={train_dl.dataset.N} != config n_mem={self.config.n_mem}: "
             f"forward 里 query 槽从第 n_mem 位切, 不一致会静默错位")
         total_steps = args.max_steps or (args.epochs * len(train_dl))
-        print(f"\n训练: steps/epoch≈{len(train_dl)}, total≈{total_steps}, "
-              f"bs={args.batch_size} 序列/批 (avg "
-              f"{train_dl.dataset.total_pairs / train_dl.dataset.num_samples:.1f} 位置/序列), "
-              f"lr={args.lr}, device={self.device}")
-        print("=" * 72)
+        if self.is_main:
+            print(f"\n训练: steps/epoch≈{len(train_dl)}, total≈{total_steps}, "
+                  f"bs={args.batch_size} 序列/rank x {self.world} rank "
+                  f"(全局 {args.batch_size * self.world} 序列/step, avg "
+                  f"{train_dl.dataset.total_pairs / train_dl.dataset.num_samples:.1f} 位置/序列), "
+                  f"lr={args.lr}, device={self.device}")
+            print("=" * 72)
 
         if args.overfit_batch:
             X, hq_tea, q_mask = next(iter(train_dl))
             X, hq_tea = X.to(self.device), hq_tea.to(self.device)
             for step in range(500):
                 m = self.train_step(X, hq_tea, q_mask, full=(step % 50 == 0))
-                self.writer.add_scalar("train/loss", m["loss"], step)
-                self.writer.add_scalar("train/div", m["div"], step)
-                self.writer.add_scalar("train/ms_norm", m["ms_norm"], step)
-                self.writer.add_scalar("train/top1", m["top1"], step)
-                if "grad_norm" in m:
-                    self.writer.add_scalar("train/grad_norm", m["grad_norm"], step)
-                if step % 50 == 0:
+                if self.writer:
+                    self.writer.add_scalar("train/loss", m["loss"], step)
+                    self.writer.add_scalar("train/div", m["div"], step)
+                    self.writer.add_scalar("train/ms_norm", m["ms_norm"], step)
+                    self.writer.add_scalar("train/top1", m["top1"], step)
+                    if "grad_norm" in m:
+                        self.writer.add_scalar("train/grad_norm", m["grad_norm"], step)
+                if self.is_main and step % 50 == 0:
                     print(f"  step {step:4d}: loss={m['loss']:.6f} div={m['div']:.6f} "
                           f"top1={m['top1']:.3f} ms_norm={m['ms_norm']:.3f} "
                           f"improve={m.get('improve', 0.0):.3f}")
-            self.writer.close()
+            if self.writer:
+                self.writer.close()
             return
 
         running = 0.0
         t0 = time.time()
         while self.global_step < total_steps:
             self.epoch += 1
+            if isinstance(train_dl.sampler, DistributedSampler):
+                train_dl.sampler.set_epoch(self.epoch)   # 每 epoch 换洗牌种子
             for X, hq_tea, q_mask in train_dl:
                 if self.global_step >= total_steps:
                     break
@@ -413,7 +467,7 @@ class OffPolicyTrainer:
                 m = self.train_step(X, hq_tea, q_mask, full=full)
                 self.global_step += 1
                 running += m["loss"]
-                if self.global_step % args.log_interval == 0:
+                if self.is_main and self.global_step % args.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
                     sps = args.log_interval / max(time.time() - t0, 1e-3)
                     mem_gb = torch.cuda.max_memory_allocated() / 1024**3
@@ -456,11 +510,16 @@ class OffPolicyTrainer:
         final = self.validate(val_dl, max_batches=200) if val_dl else {}
         self.save(args.output_dir, final)
         self._save_result({"final_metrics": final, "done": True})
-        self.writer.close()
-        print("=" * 72)
-        print(f"✅ off-policy 训练完成: {self.global_step} steps"
-              + (f", val_loss={final.get('val_loss', float('nan')):.6f}" if final else ""))
-        print(f"TensorBoard: tensorboard --logdir {Path(args.output_dir) / 'tb'}")
+        if self.writer:
+            self.writer.close()
+        if self.world > 1:
+            dist.barrier()                     # 等 rank0 存完 ckpt 再一起退出
+            dist.destroy_process_group()
+        if self.is_main:
+            print("=" * 72)
+            print(f"✅ off-policy 训练完成: {self.global_step} steps"
+                  + (f", val_loss={final.get('val_loss', float('nan')):.6f}" if final else ""))
+            print(f"TensorBoard: tensorboard --logdir {Path(args.output_dir) / 'tb'}")
 
 
 def main():
