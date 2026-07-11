@@ -223,3 +223,4 @@ scripts/smoke
 /docs
 /logs
 /checkpoints
+/eval_outputs

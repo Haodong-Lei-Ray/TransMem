@@ -41,6 +41,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
@@ -82,6 +83,9 @@ def parse_args():
     p.add_argument("--reg_weight", type=float, default=0.0,
                    help="表征回归 ||HQ'-HQ_tea||^2 权重 (热身用)")
     p.add_argument("--jsd_beta", type=float, default=0.5)
+    p.add_argument("--loss", default="kd", choices=["kd", "ce"],
+                   help="kd=蒸馏教师软分布(散度,默认); ce=对 golden token 交叉熵(SFT-on-golden, "
+                        "配 stage0 --trajectory golden 抽的特征)")
     # 训练
     p.add_argument("--output_dir", default="checkpoints/offpolicy")
     p.add_argument("--batch_size", type=int, default=16,
@@ -119,13 +123,29 @@ class OffPolicyDataset(Dataset):
     变长 M 由 collate_sequences 右 padding + q_mask 处理.
     """
 
-    def __init__(self, data_dir: str, load_dtype: torch.dtype = torch.float32):
+    def __init__(self, data_dir: str, load_dtype: torch.dtype = torch.float32,
+                 n_mem: int | None = None):
         self.data_dir = Path(data_dir)
         self.load_dtype = load_dtype
         with open(self.data_dir / "meta.json") as f:
             self.meta = json.load(f)
         self.dim = self.meta["dim"]
-        self.N = self.meta["N"]
+        # 池化 stage0 (extract --pool_ns): hm_stu 是并集池 [P,dim], 载入时按 n_mem
+        # 从每样本 hm_maps 切出 [N,dim] — 一份特征喂所有 N 的消融.
+        pool_ns = self.meta.get("pool_ns")
+        if pool_ns:
+            if n_mem is None or int(n_mem) not in pool_ns:
+                raise RuntimeError(
+                    f"池化 stage0 数据需要显式 n_mem 且在 pool_ns={pool_ns} 内, 得到 {n_mem} "
+                    f"({self.data_dir})")
+            self.N = int(n_mem)
+        else:
+            self.N = self.meta["N"]
+            if n_mem is not None and int(n_mem) != self.N:
+                raise RuntimeError(
+                    f"stage0 数据 N={self.N} != 请求 n_mem={n_mem} ({self.data_dir}); "
+                    f"非池化特征换 N 必须重抽")
+        self._pool = bool(pool_ns)
         store_dtype = _DTYPE.get(self.meta.get("save_dtype", "bfloat16"), torch.bfloat16)
 
         manifest = self.meta.get("samples")
@@ -141,6 +161,7 @@ class OffPolicyDataset(Dataset):
         self.cond_mem = torch.empty(num_samples, self.N, self.dim, dtype=store_dtype)
         self.hq_stu_flat = torch.empty(total_pairs, self.dim, dtype=store_dtype)
         self.hq_tea_flat = torch.empty(total_pairs, self.dim, dtype=store_dtype)
+        self.ans_flat = torch.full((total_pairs,), -100, dtype=torch.long)  # golden token id (CE); -100=ignore
         self.sample_offset = torch.empty(num_samples, dtype=torch.long)
         self.sample_len = torch.empty(num_samples, dtype=torch.long)
 
@@ -149,9 +170,15 @@ class OffPolicyDataset(Dataset):
             data = torch.load(self.data_dir / entry["file"], map_location="cpu",
                               weights_only=False)
             M = data["hq_stu"].shape[0]
-            self.cond_mem[s] = data["hm_stu"].to(store_dtype)
+            hm = data["hm_stu"]
+            if self._pool:
+                hm = hm[data["hm_maps"][str(self.N)]]
+            self.cond_mem[s] = hm.to(store_dtype)
             self.hq_stu_flat[cursor:cursor + M] = data["hq_stu"].to(store_dtype)
             self.hq_tea_flat[cursor:cursor + M] = data["hq_tea"].to(store_dtype)
+            _av = data.get("answer_ids")
+            if _av is not None:
+                self.ans_flat[cursor:cursor + M] = _av[:M].long()
             self.sample_offset[s] = cursor
             self.sample_len[s] = M
             cursor += M
@@ -171,7 +198,8 @@ class OffPolicyDataset(Dataset):
         hm_stu = self.cond_mem[idx].to(self.load_dtype)          # [N, dim]
         hq_stu = self.hq_stu_flat[o:o + M].to(self.load_dtype)   # [M, dim] 有序
         hq_tea = self.hq_tea_flat[o:o + M].to(self.load_dtype)   # [M, dim] 有序
-        return hm_stu, hq_stu, hq_tea
+        ans = self.ans_flat[o:o + M]                             # [M] golden token id (CE 用)
+        return hm_stu, hq_stu, hq_tea, ans
 
 
 def collate_sequences(batch):
@@ -185,18 +213,49 @@ def collate_sequences(batch):
     B, m_max, dim = len(batch), max(lens), hm.shape[-1]
     hq_stu = hm.new_zeros(B, m_max, dim)
     hq_tea = hm.new_zeros(B, m_max, dim)
+    ans = torch.full((B, m_max), -100, dtype=torch.long)         # golden token id, pad=-100 (CE ignore)
     q_mask = torch.zeros(B, m_max, dtype=torch.bool)
-    for i, (_, s, t) in enumerate(batch):
+    for i, (_, s, t, a) in enumerate(batch):
         hq_stu[i, :lens[i]] = s
         hq_tea[i, :lens[i]] = t
+        ans[i, :lens[i]] = a
         q_mask[i, :lens[i]] = True
     X = torch.cat([hm, hq_stu], dim=1)                           # [B, N+M_max, dim]
-    return X, hq_tea, q_mask
+    return X, hq_tea, ans, q_mask
+
+
+class _ConcatDatasets(torch.utils.data.ConcatDataset):
+    """多域拼接 (Qasper + HotpotQA + ...): 各子集须同 N/dim (同一 stage0 N 与 backbone dim);
+    暴露 .N/.dim 供 config 校验. __getitem__ 仍返回 (hm,hq_stu,hq_tea), collate 不变."""
+
+    def __init__(self, datasets):
+        super().__init__(datasets)
+        Ns = {d.N for d in datasets}
+        dims = {d.dim for d in datasets}
+        assert len(Ns) == 1 and len(dims) == 1, (
+            f"多域数据集 N/dim 不一致: N={Ns} dim={dims} "
+            f"(须同一 stage0 --N 与同一 backbone 的 dim)")
+        self.N = next(iter(Ns))
+        self.dim = next(iter(dims))
+        self.total_pairs = sum(d.total_pairs for d in datasets)   # 供 trainer 日志/统计
+        self.num_samples = sum(d.num_samples for d in datasets)
+        print(f"多域拼接完成: {len(datasets)} 域, 共 {self.num_samples} 样本 / "
+              f"{self.total_pairs} 位置, N={self.N} dim={self.dim}")
+
+
+def _build_dataset(data_dir, dtype, n_mem=None):
+    """data_dir 可为逗号分隔的多个 stage0 目录 -> ConcatDataset (多域训练).
+    n_mem: 池化 stage0 必填 (按 config.n_mem 切片); 非池化时用于一致性校验."""
+    dirs = [d.strip() for d in str(data_dir).split(",") if d.strip()]
+    if len(dirs) == 1:
+        return OffPolicyDataset(dirs[0], load_dtype=dtype, n_mem=n_mem)
+    return _ConcatDatasets([OffPolicyDataset(d, load_dtype=dtype, n_mem=n_mem)
+                            for d in dirs])
 
 
 def make_dataloader(data_dir, batch_size, num_workers, dtype, shuffle=True,
-                    distributed=False):
-    ds = OffPolicyDataset(data_dir, load_dtype=dtype)
+                    distributed=False, n_mem=None):
+    ds = _build_dataset(data_dir, dtype, n_mem=n_mem)
     if distributed:
         # 各 rank 分到不重叠的样本子集; 每 epoch 需 sampler.set_epoch 重洗
         sampler = DistributedSampler(ds, shuffle=shuffle, drop_last=True)
@@ -243,7 +302,9 @@ class OffPolicyTrainer:
             self.net = self.mem
 
         # 冻结 lm_head
-        lm_path = args.lm_head_path or str(Path(args.data_dir) / "lm_head.pt")
+        # 多域 data_dir 逗号分隔: 取第一个域的 lm_head.pt (同一 backbone, 各域相同)
+        _first_dir = str(args.data_dir).split(",")[0].strip()
+        lm_path = args.lm_head_path or str(Path(_first_dir) / "lm_head.pt")
         self.lm_head = FrozenLMHead.from_file(lm_path, device=self.device,
                                               dtype=self.train_dtype)
         self.loss_fn = DistillLoss(divergence=args.divergence, temperature=args.temperature,
@@ -292,13 +353,12 @@ class OffPolicyTrainer:
         for g in self.optimizer.param_groups:
             g["lr"] = lr
 
-    def compute_loss(self, X, hq_tea, q_mask, full: bool = False):
-        """X [B,N+M,dim], hq_tea [B,M,dim], q_mask [B,M] -> (loss, metrics).
+    def compute_loss(self, X, hq_tea, ans, q_mask, full: bool = False):
+        """X [B,N+M,dim], hq_tea [B,M,dim], ans [B,M] golden ids, q_mask [B,M] -> (loss, metrics).
 
-        一次并行前向算全部 query 位 MS (causal mask: 位置 i 只见 {HM, HQ_1..i}),
-        再按 q_mask 收集有效位算散度 —— padding 位不进 loss (= masked loss).
-        full=True 时额外算 baseline(MS=0)散度与改善比 (多一次 lm_head, 只在 log/val 步用).
-        ms_norm / top1 恒算 (近乎零成本).
+        一次并行前向算全部 query 位 MS (causal mask: 位置 i 只见 {HM, HQ_1..i}), 按 q_mask 收集有效位.
+        loss='ce': 对 golden token 交叉熵 (SFT-on-golden, 规避 dirty teacher);
+        loss='kd': 蒸馏教师软分布 (原路径). full=True 额外算 baseline(MS=0) 改善比.
         """
         N = self.mem.config.n_mem
         hq_stu = X[:, N:, :]                                     # [B, M, dim] 全部 query 位
@@ -310,14 +370,29 @@ class OffPolicyTrainer:
 
         valid = q_mask.to(X.device)                              # [B, M] bool
         hq_prime_v = hq_prime[valid]                             # [P, dim] 有效位
-        hq_tea_v = hq_tea[valid]                                 # [P, dim]
         student_logits = self.lm_head(hq_prime_v)                # [P, vocab]
+
+        if self.args.loss == "ce":
+            # SFT-on-golden: 直接对 golden token 交叉熵, 不需 teacher
+            ans_v = ans.to(X.device)[valid]                      # [P] golden token ids
+            loss = F.cross_entropy(student_logits, ans_v)
+            metrics = {"loss": float(loss.detach()), "div": float(loss.detach()),
+                       "positions": int(valid.sum())}
+            with torch.no_grad():
+                metrics["ms_norm"] = float(ms[valid].norm(dim=-1).mean())
+                metrics["top1"] = float((student_logits.argmax(-1) == ans_v).float().mean())
+                if full:
+                    base_ce = float(F.cross_entropy(self.lm_head(hq_stu[valid]), ans_v))
+                    metrics["base_div"] = base_ce                # MS=0 未纠正的 CE
+                    metrics["improve"] = ((base_ce - metrics["div"]) / base_ce) if base_ce > 1e-8 else 0.0
+            return loss, metrics
+
+        # ── KD (原路径): 蒸馏教师软分布 ──────────────────────────────────
+        hq_tea_v = hq_tea[valid]                                 # [P, dim]
         with torch.no_grad():
             teacher_logits = self.lm_head(hq_tea_v)
         loss, metrics = self.loss_fn(student_logits, teacher_logits, hq_prime_v, hq_tea_v)
         metrics["positions"] = int(valid.sum())
-
-        # ── 诊断量 (不进 loss, 纯监控) ──────────────────────────────────
         with torch.no_grad():
             metrics["ms_norm"] = float(ms[valid].norm(dim=-1).mean())  # 记忆偏置强度: 0->涨->稳
             metrics["top1"] = float(                             # 纠正后学生与教师 argmax 一致率
@@ -329,9 +404,9 @@ class OffPolicyTrainer:
                 metrics["improve"] = ((bd - metrics["div"]) / bd) if bd > 1e-8 else 0.0
         return loss, metrics
 
-    def train_step(self, X, hq_tea, q_mask, full: bool = False):
+    def train_step(self, X, hq_tea, ans, q_mask, full: bool = False):
         self.net.train()
-        loss, metrics = self.compute_loss(X, hq_tea, q_mask, full=full)
+        loss, metrics = self.compute_loss(X, hq_tea, ans, q_mask, full=full)
         self.optimizer.zero_grad()
         loss.backward()
         if self.args.grad_clip > 0:
@@ -345,10 +420,10 @@ class OffPolicyTrainer:
         self.mem.eval()
         agg = {"val_loss": 0.0, "val_top1": 0.0, "val_improve": 0.0}
         n = 0
-        for X, hq_tea, q_mask in dataloader:
+        for X, hq_tea, ans, q_mask in dataloader:
             X = X.to(self.device)
             hq_tea = hq_tea.to(self.device)
-            _, m = self.compute_loss(X, hq_tea, q_mask, full=True)
+            _, m = self.compute_loss(X, hq_tea, ans, q_mask, full=True)
             agg["val_loss"] += m["loss"]
             agg["val_top1"] += m["top1"]
             agg["val_improve"] += m.get("improve", 0.0)
@@ -357,24 +432,35 @@ class OffPolicyTrainer:
                 break
         return {k: v / max(n, 1) for k, v in agg.items()}
 
-    def save(self, path, metrics=None):
+    def save(self, path, metrics=None, kind="latest"):
+        """kind: latest=只覆写 latest.pt (周期性, 不累积占盘, 单 ckpt 4.6G);
+        best=覆写 best.pt + latest.pt; final=额外落 step_XXXXXXX.pt 存档.
+        长跑归档/腾空间用 checkpoints/upload_ckpt.sh 传对象存储."""
         if not self.is_main:
             return
         Path(path).mkdir(parents=True, exist_ok=True)
-        ckpt = {"model_state_dict": self.mem.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
+        base = {"model_state_dict": self.mem.state_dict(),
                 "config": self.config.to_dict(), "global_step": self.global_step,
                 "epoch": self.epoch}
         if metrics:
-            ckpt["metrics"] = metrics
-        torch.save(ckpt, Path(path) / f"step_{self.global_step:07d}.pt")
-        torch.save(ckpt, Path(path) / "latest.pt")
-        print(f"  Checkpoint saved: step_{self.global_step:07d}.pt")
+            base["metrics"] = metrics
+        # latest.pt 带 optimizer (断点续训需要); best/final 只存 model_state_dict —
+        # 评测/推理够用, 省盘 (8B TransMem 含 optimizer 12.6G, 只存 model 4.2G).
+        torch.save(dict(base, optimizer_state_dict=self.optimizer.state_dict()),
+                   Path(path) / "latest.pt")
+        names = ["latest.pt"]
+        if kind == "best":
+            torch.save(base, Path(path) / "best.pt"); names.append("best.pt(model-only)")
+        elif kind == "final":
+            fn = f"step_{self.global_step:07d}.pt"
+            torch.save(base, Path(path) / fn); names.append(f"{fn}(model-only)")
+        print(f"  Checkpoint saved: {', '.join(names)} (step {self.global_step})")
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.mem.load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "optimizer_state_dict" in ckpt:          # best.pt 是 model-only, 无 optimizer
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.global_step = ckpt.get("global_step", 0)
         self.epoch = ckpt.get("epoch", 0)
         self._load_result()   # 恢复 best_val, 避免 resume 后覆盖历史最优
@@ -414,10 +500,12 @@ class OffPolicyTrainer:
         args = self.args
         train_dl = make_dataloader(args.data_dir, args.batch_size, args.num_workers,
                                    self.train_dtype, shuffle=True,
-                                   distributed=(self.world > 1))
+                                   distributed=(self.world > 1),
+                                   n_mem=self.config.n_mem)
         # 验证只在 rank0 做 (裸模块前向, 无集合通信; 其余 rank 在下个 backward 处等它)
         val_dl = (make_dataloader(args.val_data_dir, args.batch_size, args.num_workers,
-                                  self.train_dtype, shuffle=False)
+                                  self.train_dtype, shuffle=False,
+                                  n_mem=self.config.n_mem)
                   if (args.val_data_dir and self.is_main) else None)
         assert train_dl.dataset.N == self.config.n_mem, (
             f"Stage0 数据 N={train_dl.dataset.N} != config n_mem={self.config.n_mem}: "
@@ -432,10 +520,10 @@ class OffPolicyTrainer:
             print("=" * 72)
 
         if args.overfit_batch:
-            X, hq_tea, q_mask = next(iter(train_dl))
+            X, hq_tea, ans, q_mask = next(iter(train_dl))
             X, hq_tea = X.to(self.device), hq_tea.to(self.device)
             for step in range(500):
-                m = self.train_step(X, hq_tea, q_mask, full=(step % 50 == 0))
+                m = self.train_step(X, hq_tea, ans, q_mask, full=(step % 50 == 0))
                 if self.writer:
                     self.writer.add_scalar("train/loss", m["loss"], step)
                     self.writer.add_scalar("train/div", m["div"], step)
@@ -457,14 +545,14 @@ class OffPolicyTrainer:
             self.epoch += 1
             if isinstance(train_dl.sampler, DistributedSampler):
                 train_dl.sampler.set_epoch(self.epoch)   # 每 epoch 换洗牌种子
-            for X, hq_tea, q_mask in train_dl:
+            for X, hq_tea, ans, q_mask in train_dl:
                 if self.global_step >= total_steps:
                     break
                 self._set_lr(self.global_step, total_steps)
                 X, hq_tea = X.to(self.device), hq_tea.to(self.device)
                 # 该步过后若触发 log, 就算上 baseline 诊断 (base_div/improve)
                 full = ((self.global_step + 1) % args.log_interval == 0)
-                m = self.train_step(X, hq_tea, q_mask, full=full)
+                m = self.train_step(X, hq_tea, ans, q_mask, full=full)
                 self.global_step += 1
                 running += m["loss"]
                 if self.is_main and self.global_step % args.log_interval == 0:
@@ -503,12 +591,13 @@ class OffPolicyTrainer:
                     if vm["val_loss"] < self.best_val:
                         self.best_val = vm["val_loss"]
                         self.best_step = self.global_step
-                        self.save(args.output_dir, {"val_loss": self.best_val, "best": True})
+                        self.save(args.output_dir, {"val_loss": self.best_val, "best": True},
+                                  kind="best")
                         self._save_result({"best_metrics": vm})
                 if self.global_step % args.save_interval == 0:
                     self.save(args.output_dir)
         final = self.validate(val_dl, max_batches=200) if val_dl else {}
-        self.save(args.output_dir, final)
+        self.save(args.output_dir, final, kind="final")
         self._save_result({"final_metrics": final, "done": True})
         if self.writer:
             self.writer.close()

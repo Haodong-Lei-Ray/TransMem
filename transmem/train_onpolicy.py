@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transmem import TransMemConfig, TransMem, DistillLoss
 from transmem.extract_features import (
-    load_records, extract_cs, build_chat_prompt_ids, resolve_eos_ids)
+    load_records, extract_cs, build_chat_prompt_ids, resolve_eos_ids, hm_positions)
 
 _DTYPE = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
@@ -95,11 +95,12 @@ def parse_args():
 class OnPolicyRollout:
     """封装冻结 LLM + tokenizer, 提供学生 rollout 与教师 TF (全程 no_grad, LLM 仅 forward)."""
 
-    def __init__(self, model, tokenizer, device, N: int, dtype):
+    def __init__(self, model, tokenizer, device, N: int, dtype, hm_mode: str = "floor"):
         self.model = model
         self.tok = tokenizer
         self.device = device
         self.N = N
+        self.hm_mode = hm_mode      # HM 取位公式, 必须与该 ckpt 的 stage0 一致 (config.hm_mode)
         self.dtype = dtype
         self.dim = model.config.hidden_size
         self.eos_ids = resolve_eos_ids(model)
@@ -110,10 +111,9 @@ class OnPolicyRollout:
         return self.model.model.norm.register_forward_hook(hook_fn)
 
     def _extract_hm(self, hidden_prefill: torch.Tensor, len_cl: int) -> torch.Tensor:
-        """prefill hidden [L,dim] 中 C_L 前 len_cl 个位置分 N 段取末位 -> [N,dim]."""
-        N = self.N
-        seg = max(len_cl // N, 1)
-        idx = [max(min((i + 1) * seg, len_cl) - 1, 0) for i in range(N)]
+        """prefill hidden [L,dim] 中 C_L 前 len_cl 个位置取 N 个记忆槽 -> [N,dim].
+        取位公式与 stage0 共用 hm_positions (floor=历史 ckpt, frac=池化消融 ckpt)."""
+        idx = hm_positions(len_cl, self.N, self.hm_mode)
         return hidden_prefill[torch.tensor(idx, device=hidden_prefill.device)]
 
     @torch.no_grad()

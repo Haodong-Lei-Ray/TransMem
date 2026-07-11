@@ -22,10 +22,10 @@ PY="$UV run --python $VENV/bin/python python"
 DATA=/mnt/petrelfs/leihaodong/Project4/data/qasper
 
 N=${N:-4}
-MAX_ANS=${MAX_ANS:-128}
+MAX_ANS=${MAX_ANS:-1024}
 ATTN=${ATTN:-sdpa}          # flash_attention_2 在本 venv import 失败, 默认 sdpa
 MAXN=${MAXN:-}              # 可选: 只抽前 MAXN 条 (先小跑); 空=全量
-THINKING=${THINKING:-false} # true=开启 thinking 系统提示 (build_chat_prompt_ids thinking=True)
+THINKING=${THINKING:-true}  # true=开启 thinking 系统提示 (build_chat_prompt_ids thinking=True)
 
 # ── s3mount: 挂载 Qwen3-4B 模型 (权重是 S3 存储对象, 本地无) ──────────────
 mkdir -p /mnt/petrelfs/leihaodong/s3mount_logs
@@ -60,11 +60,15 @@ echo "Model (s3mount): ${MODEL_PATH}"
 
 cd $PROJ
 
+# 输出根目录: 与 run_offpolicy.sh 的 DATA_ROOT 默认值对齐 (按模型名分目录)
+OUT_ROOT=${OUT_ROOT:-$PROJ/data/qasper_data/Qwen3-4B-Instruct-2507}
+mkdir -p "$OUT_ROOT"
+
 # 训练集 (2240 QA)
 $PY -m transmem.extract_features \
   --data_path $DATA/qasper_train.json --data_format qasper \
   --model_path $MODEL_PATH \
-  --output_dir $PROJ/data/qasper_data/stage0_train_short128 \
+  --output_dir $OUT_ROOT/stage0_train_think1024 \
   --N $N --max_answer_tokens $MAX_ANS \
   --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
   $([ "$THINKING" = "true" ] && echo --thinking)
@@ -73,9 +77,9 @@ $PY -m transmem.extract_features \
 $PY -m transmem.extract_features \
   --data_path $DATA/qasper_dev.json --data_format qasper \
   --model_path $MODEL_PATH \
-  --output_dir $PROJ/data/qasper_data/stage0_dev_short128 \
+  --output_dir $OUT_ROOT/stage0_dev_think1024 \
   --N $N --max_answer_tokens $MAX_ANS \
   --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
   $([ "$THINKING" = "true" ] && echo --thinking)
 
-echo "✅ Stage 0 完成: $PROJ/data/stage0_train , stage0_dev"
+echo "✅ Stage 0 完成: $OUT_ROOT/stage0_train_think1024 , stage0_dev_think1024"

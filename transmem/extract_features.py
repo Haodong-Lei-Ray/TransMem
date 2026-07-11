@@ -25,6 +25,12 @@ LLM 全程冻结. hidden 取 model.model.norm 输出 (最后 RMSNorm 之后、LM
     --model_path /path/to/Qwen3-4B-Instruct-2507 \
     --output_dir data/stage0_train \
     --N 4 --max_answer_tokens 50
+
+并发: --num_workers K 开多进程数据并行 (每 worker 一份模型副本, 轮转绑定可见 GPU,
+样本按 records[w::K] 交错切分); 产物布局与顺序版一致. 线程不可行: hook 在共享模型上
+注册/摘除, 并发调用会互相污染捕获的 hidden state.
+断点续抽: worker manifest 逐样本追加写 JSONL (output_dir/.worker_manifests/),
+中途崩溃后用相同参数重跑即可跳过已完成样本; 参数 (含 num_workers) 变了则自动重抽.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ import math
 import os
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Optional
@@ -64,11 +71,29 @@ def parse_args():
     p.add_argument("--attn_impl", default="flash_attention_2",
                    choices=["flash_attention_2", "sdpa", "eager"])
     p.add_argument("--N", type=int, default=4, help="记忆分段数 (HM_stu = [N, dim])")
+    p.add_argument("--pool_ns", default="",
+                   help="记忆池消融: 逗号分隔 N 列表 (如 4,8,16,32,64,128,256,384). 非空时 "
+                        "hm_stu 存全部 N 的取位并集 [P,dim] + hm_pos/hm_maps 索引表, --N 被忽略; "
+                        "训练时按 config.n_mem 从池切片, 一次提取喂所有 N (须 --hm_mode frac)")
+    p.add_argument("--hm_mode", default="floor", choices=["floor", "frac"],
+                   help="HM 取位公式: floor=len_cl//N 分段 (历史默认); frac=ceil((i+1)*len_cl/N)-1 "
+                        "(N 整除 N' 时位置嵌套, 记忆池只需存并集; 末槽恰为 C_L 末 token)")
+    p.add_argument("--manifest_dir", default=None,
+                   help="worker manifest 目录 (默认 output_dir/.worker_manifests). "
+                        "output_dir 在 s3mount 上时必须指到本地盘: JSONL 追加写对象存储不支持")
+    p.add_argument("--trajectory", default="teacher", choices=["teacher", "golden"],
+                   help="轨迹来源: teacher=教师(C_S)rollout 当目标(off-policy KD, 默认); "
+                        "golden=直接 teacher-force 数据集 golden 答案(SFT-on-golden, 无 teacher rollout, "
+                        "存 answer_ids=golden 供 CE loss; 规避 dirty teacher)")
     p.add_argument("--max_answer_tokens", type=int, default=50)
     p.add_argument("--samples_per_shard", type=int, default=1000)
     p.add_argument("--save_dtype", default="bfloat16",
                    choices=["float16", "bfloat16", "float32"])
     p.add_argument("--max_samples", type=int, default=None)
+    p.add_argument("--num_workers", type=int, default=1,
+                   help="数据并行进程数: 每个 worker 一份模型副本, 轮转绑定可见 GPU "
+                        "(worker w -> cuda:{w %% device_count}); 超过 GPU 数则多 worker 共卡, 注意显存. "
+                        "样本按 records[w::K] 交错切分, 产物布局与顺序版一致")
     p.add_argument("--dump_lm_head", action="store_true", default=True,
                    help="是否 dump 冻结 lm_head (off-policy KD 需要)")
     p.add_argument("--thinking", action="store_true",
@@ -79,6 +104,54 @@ def parse_args():
 def get_dtype(s: str) -> torch.dtype:
     return {"float32": torch.float32, "float16": torch.float16,
             "bfloat16": torch.bfloat16}[s]
+
+
+def hm_positions(len_cl: int, N: int, mode: str = "floor") -> list[int]:
+    """C_L 前 len_cl 个 token 位置中取 N 个记忆槽位置 (每段末位).
+
+    floor: seg=len_cl//N, idx=(i+1)*seg-1 —— 历史公式, 段尾对不齐文末,
+           且不同 N 的位置不互为子集 (floor 舍入).
+    frac : idx=ceil((i+1)*len_cl/N)-1 —— 末槽=len_cl-1; N 整除 N' 时
+           positions(N) ⊆ positions(N') 严格嵌套, 记忆池消融只存一份并集.
+    训练 (stage0) 与推理 (OnPolicyRollout) 必须走同一 mode, 记录在 ckpt config.hm_mode.
+    """
+    if mode == "frac":
+        return [max(math.ceil((i + 1) * len_cl / N) - 1, 0) for i in range(N)]
+    seg = max(len_cl // N, 1)
+    return [max(min((i + 1) * seg, len_cl) - 1, 0) for i in range(N)]
+
+
+def _parse_pool_ns(args) -> list[int]:
+    pool = getattr(args, "pool_ns", "") or ""
+    return sorted({int(x) for x in str(pool).split(",") if x.strip()})
+
+
+def atomic_save(obj, path, retries: int = 8) -> None:
+    """torch.save 到本地临时文件, 再整块 copy 到目标 (带退避重试).
+
+    目标在 s3mount 上时必须这样: torch.save 的 zip 写法需要 seek 回填目录,
+    对象存储只支持顺序写新文件. 本地目标也顺带获得半写崩溃保护.
+    重试: s3mount/Ceph 偶发瞬时 EIO (10209436 实测两 worker 同刻 Errno 5,
+    其余正常) — 退避重跑 copy; 持续失败才抛出 (fail-fast 交给 watchdog)."""
+    import shutil
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".pt")
+    os.close(fd)
+    try:
+        torch.save(obj, tmp)
+        for attempt in range(retries):
+            try:
+                shutil.copyfile(tmp, str(path))
+                return
+            except OSError as e:
+                if attempt == retries - 1:
+                    raise
+                wait = (2, 10, 30, 60, 90, 120, 150, 180)[min(attempt, 7)]
+                print(f"  [WARN] 写 {path} 失败 ({e}), {wait}s 后重试 "
+                      f"({attempt + 1}/{retries})", flush=True)
+                time.sleep(wait)
+    finally:
+        os.unlink(tmp)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -157,6 +230,9 @@ def _load_hotpotqa_agentmem(data_path: str, max_samples: Optional[int]):
     for i in range(len(df)):
         row = df.iloc[i]
         rec = _parse_parquet_row(row, i)
+        # MemAgent parquet 的 extra_info.index 是数据集行号而非证据文档号,
+        # golden_index 只能来自 map 回填; 置 None 保证查不到时样本被跳过而非错切 C_S.
+        rec["golden_index"] = None
         if not rec["context"]:
             records.append(rec)
             continue
@@ -169,19 +245,23 @@ def _load_hotpotqa_agentmem(data_path: str, max_samples: Optional[int]):
             records.append(rec)
             continue
 
-        # 在 context 中找 "Document N: {title}" 匹配
-        golden_index = None
+        # 在 context 中找 "Document N: {title}" 匹配.
+        # HotpotQA 每题恰有 2 篇 golden 文档 (多跳), C_S 必须是全部证据的并集 —
+        # 只取第一篇会让教师只见半份证据, 实测教师反而比学生差 (dev contains
+        # 0.375 vs 0.531), 蒸馏目标被污染 (48% 训练答案不含正确答案).
+        golden_indices = []
         for m in doc_header_re.finditer(rec["context"]):
             doc_num = int(m.group(1))
             doc_title = m.group(2).strip()
-            for gt in golden_titles:
-                if gt.lower() in doc_title.lower():
-                    golden_index = doc_num
-                    break
-            if golden_index is not None:
-                break
+            if any(gt.lower() in doc_title.lower() for gt in golden_titles):
+                if doc_num not in golden_indices:
+                    golden_indices.append(doc_num)
 
-        rec["golden_index"] = golden_index
+        if golden_indices:
+            rec["golden_index"] = golden_indices[0]   # 仅供日志/调试
+            rec["cs_text"] = "\n\n".join(
+                cs for gi in golden_indices
+                if (cs := extract_cs(rec["context"], gi)))
         records.append(rec)
 
     if missing_golden > 0:
@@ -295,6 +375,11 @@ class Stage0Extractor:
         self.model_dtype = get_dtype(args.dtype)
         self.save_dtype = get_dtype(args.save_dtype)
         self.N = args.N
+        self.trajectory = getattr(args, "trajectory", "teacher")
+        self.hm_mode = getattr(args, "hm_mode", "floor")
+        self.pool_ns = _parse_pool_ns(args)
+        if self.pool_ns:
+            assert self.hm_mode == "frac", "--pool_ns 依赖 frac 取位的嵌套性, 须 --hm_mode frac"
 
     def load_model(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -321,12 +406,20 @@ class Stage0Extractor:
         print(f"  dim={self.dim}, 设备={self.device}, eos_ids={self._eos_ids}")
 
     def dump_lm_head(self, output_dir: Path):
-        """dump 冻结 lm_head 权重 [vocab, dim] -> output_dir/lm_head.pt (off-policy KD 用)."""
+        """dump 冻结 lm_head 权重 [vocab, dim] -> output_dir/lm_head.pt (off-policy KD 用).
+        已存在且非空则跳过: 权重确定不变, 且 778MB 多段上传在桶临界抖动时必炸 (10210334)."""
+        target = output_dir / "lm_head.pt"
+        try:
+            if target.exists() and target.stat().st_size > 700_000_000:
+                print(f"  lm_head.pt 已存在 ({target.stat().st_size}B), 跳过 dump")
+                return
+        except OSError:
+            pass
         w = self.model.lm_head.weight.detach().to(self.save_dtype).cpu()
         tied = bool(getattr(self.model.config, "tie_word_embeddings", False))
-        torch.save({"weight": w, "tied": tied,
-                    "vocab_size": w.shape[0], "dim": w.shape[1]},
-                   output_dir / "lm_head.pt")
+        atomic_save({"weight": w, "tied": tied,
+                     "vocab_size": w.shape[0], "dim": w.shape[1]},
+                    output_dir / "lm_head.pt")
         print(f"  dump lm_head.pt: weight{tuple(w.shape)} tied={tied}")
 
     # ── 教师生成答案 + 顺带捕获 HQ_tea_i (无需二次 forward) ──────────────
@@ -364,7 +457,8 @@ class Stage0Extractor:
     # ── 学生 forward: HM_stu + HQ_stu_i ──────────────────────────────
     @torch.inference_mode()
     def student_forward(self, context_long: str, question: str, answer_ids: list[int]):
-        """(C_L, Q, A_[1:M-1]) -> (HM_stu [N, dim], HQ_stu_i [M, dim]).
+        """(C_L, Q, A_[1:M-1]) -> (HM_stu [N|P, dim], HQ_stu_i [M, dim], hm_extras).
+        hm_extras: 池化模式下的 hm_pos/hm_maps/len_cl (单 N 模式为 {}).
         全程 token-id 空间拼接, 避免 BPE 边界 merge / 特殊 token 约定导致的位置错位."""
         M = len(answer_ids)
         cq_ids = build_chat_prompt_ids(self.tokenizer, context_long, question, self.device,
@@ -376,13 +470,14 @@ class Stage0Extractor:
 
         if M <= 1:
             hidden = self._forward_ids_and_hook(cq_ids)
-            return self._extract_hm(hidden, len_cl), hidden[-1:, :]
+            hm, hm_extras = self._extract_hm(hidden, len_cl)
+            return hm, hidden[-1:, :], hm_extras
 
         prefix_ids = torch.tensor([answer_ids[:-1]], device=self.device, dtype=cq_ids.dtype)
         full_ids = torch.cat([cq_ids, prefix_ids], dim=1)
         hidden = self._forward_ids_and_hook(full_ids)
         total_len = hidden.shape[0]
-        hm = self._extract_hm(hidden, len_cl)
+        hm, hm_extras = self._extract_hm(hidden, len_cl)
 
         positions = [len_cq - 1]                         # 预测 A[0]=HQ_stu_1
         for i in range(2, M + 1):
@@ -392,14 +487,32 @@ class Stage0Extractor:
             else:
                 break
         hq = hidden[torch.tensor(positions, device=hidden.device, dtype=torch.long)]
-        return hm, hq
+        return hm, hq, hm_extras
 
-    def _extract_hm(self, hidden: torch.Tensor, len_cl: int) -> torch.Tensor:
-        """C_L 前 len_cl 个位置分 N 段, 取每段末位 hidden."""
-        N = self.N
-        seg = max(len_cl // N, 1)
-        idx = [max(min((i + 1) * seg, len_cl) - 1, 0) for i in range(N)]
-        return hidden[torch.tensor(idx, device=hidden.device, dtype=torch.long)]
+    def _extract_hm(self, hidden: torch.Tensor, len_cl: int):
+        """C_L 前 len_cl 个位置取记忆槽 hidden.
+
+        单 N 模式: 返回 (hm [N,dim], {}).
+        池化模式 (--pool_ns): 返回 (hm_pool [P,dim], extras), extras 存进 .pt:
+          hm_pos  [P]  并集里每行对应的 token 位置 (调试/校验用)
+          hm_maps {str(N): LongTensor[N]}  每个 N 在池里的行索引
+          len_cl  int
+        """
+        if self.pool_ns:
+            per_n = {n: hm_positions(len_cl, n, "frac") for n in self.pool_ns}
+            union = sorted({p for pos in per_n.values() for p in pos})
+            row = {p: r for r, p in enumerate(union)}
+            hm = hidden[torch.tensor(union, device=hidden.device, dtype=torch.long)]
+            extras = {
+                "hm_pos": torch.tensor(union, dtype=torch.long),
+                "hm_maps": {str(n): torch.tensor([row[p] for p in per_n[n]],
+                                                 dtype=torch.long)
+                            for n in self.pool_ns},
+                "len_cl": len_cl,
+            }
+            return hm, extras
+        idx = hm_positions(len_cl, self.N, self.hm_mode)
+        return hidden[torch.tensor(idx, device=hidden.device, dtype=torch.long)], {}
 
     def _forward_ids_and_hook(self, ids: torch.Tensor) -> torch.Tensor:
         captured = {}
@@ -420,30 +533,49 @@ class Stage0Extractor:
             sample_idx = rec["sample_idx"]
             if not question or not context_long:
                 return None
-            # C_S: qasper 等已直供 cs_text; 否则按 golden_index 正则切 (hotpot)
-            cs_text = rec.get("cs_text") or (
-                extract_cs(context_long, golden_index) if golden_index is not None else "")
-            if not cs_text:
-                print(f"  [WARN] sample {sample_idx}: C_S 为空 (golden_index={golden_index})")
-                return None
+            if self.trajectory == "golden":
+                # SFT-on-golden: 直接 teacher-force 数据集 golden 答案, 不做 teacher rollout,
+                # 规避 "教师看 evidence 生成的答案是脏的" 问题; answer_ids=golden 供 CE loss.
+                golden = str(rec.get("ground_truth", "")).strip()
+                if not golden:
+                    print(f"  [WARN] sample {sample_idx}: golden 答案为空, 跳过")
+                    return None
+                gids = self.tokenizer(golden, add_special_tokens=False).input_ids
+                gids = gids[:self.args.max_answer_tokens]
+                if self._eos_ids:
+                    gids = gids + [self._eos_ids[0]]        # 末尾 EOS 教模型停
+                if len(gids) == 0:
+                    return None
+                answer_ids, answer_text = gids, golden
+                hm_stu, hq_stu, hm_extras = self.student_forward(context_long, question, answer_ids)
+                hq_tea = hq_stu    # dummy (CE 不用 teacher; 存同形保持 .pt 格式一致)
+            else:
+                # off-policy KD: C_S teacher rollout 当软目标 (原路径)
+                cs_text = rec.get("cs_text") or (
+                    extract_cs(context_long, golden_index) if golden_index is not None else "")
+                if not cs_text:
+                    print(f"  [WARN] sample {sample_idx}: C_S 为空 (golden_index={golden_index})")
+                    return None
+                answer_ids, answer_text, hq_tea = self.generate_answer(cs_text, question)
+                if len(answer_ids) == 0:
+                    return None
+                hm_stu, hq_stu, hm_extras = self.student_forward(context_long, question, answer_ids)
 
-            answer_ids, answer_text, hq_tea = self.generate_answer(cs_text, question)
-            if len(answer_ids) == 0:
-                return None
-            hm_stu, hq_stu = self.student_forward(context_long, question, answer_ids)
-
-            actual_M = min(hq_tea.shape[0], hq_stu.shape[0])
+            actual_M = min(hq_tea.shape[0], hq_stu.shape[0], len(answer_ids))
             if actual_M < 1:
                 return None
-            return {
+            out = {
                 "hm_stu": hm_stu.to(dtype=self.save_dtype).cpu(),
                 "hq_stu": hq_stu[:actual_M].to(dtype=self.save_dtype).cpu(),
                 "hq_tea": hq_tea[:actual_M].to(dtype=self.save_dtype).cpu(),
                 "answer_ids": torch.tensor(answer_ids[:actual_M], dtype=torch.long),
                 "answer_text": answer_text,
                 "sample_idx": sample_idx,
-                "M": actual_M, "dim": self.dim, "N": self.N,
+                "M": actual_M, "dim": self.dim,
+                "N": (None if self.pool_ns else self.N),
             }
+            out.update(hm_extras)     # 池化: hm_pos / hm_maps / len_cl
+            return out
         except Exception as e:
             print(f"  [ERROR] sample {rec['sample_idx']}: {e}")
             traceback.print_exc()
@@ -483,7 +615,7 @@ class Stage0Extractor:
                     continue
                 M = result.pop("M")
                 fname = f"sample_{global_i:05d}.pt"
-                torch.save(result, shard_dir / fname)
+                atomic_save(result, shard_dir / fname)
                 shard_samples.append(global_i)
                 manifest.append({"sample_idx": global_i, "shard_idx": shard_idx,
                                  "file": f"shard_{shard_idx:04d}/{fname}", "M": M})
@@ -500,7 +632,9 @@ class Stage0Extractor:
 
         meta = {
             "data_path": args.data_path, "data_format": args.data_format,
-            "model_path": args.model_path, "N": args.N, "dim": self.dim,
+            "model_path": args.model_path,
+            "N": (None if self.pool_ns else args.N), "dim": self.dim,
+            "pool_ns": (self.pool_ns or None), "hm_mode": self.hm_mode,
             "save_dtype": args.save_dtype, "max_answer_tokens": args.max_answer_tokens,
             "total_records": n_total, "succeeded": n_total - failed, "failed": failed,
             "total_pairs": total_pairs, "num_shards": num_shards,
@@ -510,6 +644,265 @@ class Stage0Extractor:
             json.dump(meta, f, indent=2)
         print("=" * 72)
         print(f"✅ Stage 0 完成: 成功 {meta['succeeded']}/{n_total}, 共 {total_pairs} (X, HQ_tea) 对")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 多进程数据并行 (--num_workers > 1)
+# ═══════════════════════════════════════════════════════════════════════════
+# 不能用线程: generate_answer/student_forward 在同一模型上注册/摘除 forward hook,
+# 并发调用会互相捕获对方的 hidden state. 因此每 worker 一个进程 + 一份模型副本.
+
+def _read_manifest_done(path) -> dict[int, dict]:
+    """读一个 worker manifest JSONL, 返回成功样本 {sample_idx: entry}.
+    只算成功: 失败可能是坏 GPU/CUDA 挂死等瞬态原因, 重跑时重试;
+    真正的 C_S 为空失败在 GPU 前就返回, 重试代价毫秒级. 半行 (崩溃残留) 丢弃."""
+    done: dict[int, dict] = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "sample_idx" in e and not e.get("failed"):
+                    done[e["sample_idx"]] = e
+    return done
+
+
+def _worker_entry(worker_id: int, args, records: list, manifest_path: str,
+                  global_done: Optional[set] = None):
+    """单 worker: 处理自己的样本切片, .pt 直接落盘 (文件名含全局 sample_idx, 无冲突).
+    manifest 逐样本追加写 JSONL 到 manifest_path (崩溃重跑时按已有行断点续抽),
+    末行 {"done": true, "dim": ...} 标记本切片完成, 由父进程合并.
+    global_done: 父进程汇总的全 worker 已完成集合 — 换 num_workers 重跑时,
+    样本会重新交错分片, 自己 manifest 里没有但别的 worker 做过的样本也要跳过."""
+    ngpu = torch.cuda.device_count()
+    if ngpu > 0:
+        args.device = f"cuda:{worker_id % ngpu}"
+
+    done = _read_manifest_done(manifest_path)
+    if global_done:
+        done = {**dict.fromkeys(global_done, None), **done}
+    todo = [r for r in records if r["sample_idx"] not in done]
+    print(f"[W{worker_id}] 启动: device={args.device}, {len(records)} 条"
+          + (f" (续抽: 已有 {len(done)}, 剩 {len(todo)})" if done else ""), flush=True)
+
+    extractor = Stage0Extractor(args)
+    extractor.load_model()
+    output_dir = Path(args.output_dir)
+    if worker_id == 0 and args.dump_lm_head:
+        extractor.dump_lm_head(output_dir)
+
+    # 上次崩溃可能留下无换行的半行, 先补换行, 避免新条目黏连坏掉
+    if os.path.exists(manifest_path) and os.path.getsize(manifest_path) > 0:
+        with open(manifest_path, "rb") as rf:
+            rf.seek(-1, os.SEEK_END)
+            needs_nl = rf.read(1) != b"\n"
+        if needs_nl:
+            with open(manifest_path, "a") as f:
+                f.write("\n")
+
+    shard_size = args.samples_per_shard
+    failed = 0
+    with open(manifest_path, "a") as mf:
+        for k, rec in enumerate(todo):
+            result = extractor.process_sample(rec)
+            sid = rec["sample_idx"]
+            if result is None:
+                failed += 1
+                entry = {"sample_idx": sid, "failed": True}
+            else:
+                M = result.pop("M")
+                shard_idx = sid // shard_size
+                shard_dir = output_dir / f"shard_{shard_idx:04d}"
+                shard_dir.mkdir(parents=True, exist_ok=True)
+                fname = f"sample_{sid:05d}.pt"
+                atomic_save(result, shard_dir / fname)
+                entry = {"sample_idx": sid, "shard_idx": shard_idx,
+                         "file": f"shard_{shard_idx:04d}/{fname}", "M": M}
+            mf.write(json.dumps(entry) + "\n")
+            mf.flush()
+            if (k + 1) % 20 == 0 or k + 1 == len(todo):
+                print(f"[W{worker_id}] {k + 1}/{len(todo)} fail={failed}", flush=True)
+            if (k + 1) % 100 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+        mf.write(json.dumps({"done": True, "worker_id": worker_id,
+                             "dim": extractor.dim}) + "\n")
+
+
+def run_parallel(args):
+    """父进程: 载数据 -> 交错切片 spawn K 个 worker -> 合并 manifest 写 meta.json.
+    输出布局 (shard_XXXX/sample_XXXXX.pt + 每 shard meta.json + 顶层 meta.json)
+    与顺序版 Stage0Extractor.run() 完全一致."""
+    import multiprocessing as mp
+    import shutil
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    records = load_records(args.data_path, args.data_format, args.max_samples)
+    n_total = len(records)
+    K = min(args.num_workers, max(n_total, 1))
+    shard_size = args.samples_per_shard
+    num_shards = math.ceil(n_total / shard_size)
+    print(f"\n并行抽取: {n_total} 条 / {K} workers -> {num_shards} shards (每 {shard_size})")
+    print(f"输出: {output_dir.resolve()}  N={args.N} max_ans={args.max_answer_tokens}")
+    print("=" * 72)
+
+    # 断点续抽: manifest 目录带 run 配置指纹, 一致则续抽, 不一致则清空重来.
+    # output_dir 在 s3mount 上时用 --manifest_dir 指到本地盘 (JSONL 追加写对象存储不支持).
+    pool_ns = _parse_pool_ns(args)
+    tmp_dir = (Path(args.manifest_dir) if getattr(args, "manifest_dir", None)
+               else output_dir / ".worker_manifests")
+    # 指纹不含 num_workers: 样本按 sample_idx 全局标识, 换 worker 数续抽也安全
+    # (global_done 跨切片跳过 + 合并 glob 全部 worker 文件).
+    fingerprint = {"data_path": args.data_path, "data_format": args.data_format,
+                   "max_samples": args.max_samples, "N": args.N,
+                   "pool_ns": pool_ns, "hm_mode": getattr(args, "hm_mode", "floor"),
+                   "max_answer_tokens": args.max_answer_tokens,
+                   "thinking": bool(args.thinking),
+                   "n_total": n_total}
+    fp_path = tmp_dir / "run_config.json"
+    if tmp_dir.exists():
+        old_fp = None
+        if fp_path.exists():
+            with open(fp_path) as f:
+                old_fp = json.load(f)
+        if isinstance(old_fp, dict):
+            old_fp.pop("num_workers", None)   # 兼容旧指纹 (曾含 num_workers)
+        if old_fp == fingerprint:
+            print("  检测到上次未完成的 worker manifest, 断点续抽")
+        else:
+            print("  上次 run 配置不同, 清空 worker manifest 重抽")
+            shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    with open(fp_path, "w") as f:
+        json.dump(fingerprint, f)
+
+    # 全局断点集合: 汇总所有历史 worker 文件的成功样本 (换 K 后交错切片会变,
+    # 自己文件里没有的完成样本也必须跳过). 顺带重写文件: 只留成功行, 清掉
+    # 历史 done 标记 (否则换 K 后旧标记会骗过合并校验) 与半行/失败行.
+    global_done: set = set()
+    for wp in sorted(tmp_dir.glob("worker_*.jsonl")):
+        d = _read_manifest_done(wp)
+        global_done.update(d.keys())
+        tmpf = str(wp) + ".tmp"
+        with open(tmpf, "w") as f:
+            for e in d.values():
+                f.write(json.dumps(e) + "\n")
+        os.replace(tmpf, wp)
+    if global_done:
+        print(f"  全局断点: 已完成 {len(global_done)} 样本")
+
+    ctx = mp.get_context("spawn")           # CUDA 子进程必须 spawn
+    procs = []
+    for w in range(K):
+        p = ctx.Process(target=_worker_entry,
+                        args=(w, args, records[w::K], str(tmp_dir / f"worker_{w}.jsonl"),
+                              global_done))
+        p.start()
+        procs.append(p)
+
+    # watchdog: 任一 worker 异常退出或 30min 无 manifest 进展 (坏卡上 CUDA 调用会
+    # 无限挂死, 不抛异常) → 立即终止全体 fail-fast; requeue 换节点后按 JSONL 续抽,
+    # 比让好 worker 慢慢跑完再失败划算 (实测坏节点一次废 6/8 张卡).
+    stall_sec = 1800
+    t_start = time.time()
+    abort_reason = None
+    while True:
+        alive = [w for w, p in enumerate(procs) if p.is_alive()]
+        if not alive:
+            break
+        crashed = [w for w, p in enumerate(procs)
+                   if not p.is_alive() and p.exitcode != 0]
+        if crashed:
+            abort_reason = f"worker {crashed} 异常退出 (exitcode={[procs[w].exitcode for w in crashed]})"
+        else:
+            stalled = []
+            for w in alive:
+                wp = tmp_dir / f"worker_{w}.jsonl"
+                last = os.path.getmtime(wp) if wp.exists() else 0.0
+                if time.time() - max(last, t_start) > stall_sec:
+                    stalled.append(w)
+            if stalled:
+                abort_reason = f"worker {stalled} 超过 {stall_sec}s 无进展 (CUDA 挂死/坏卡?)"
+        if abort_reason:
+            print(f"[watchdog] {abort_reason}; 终止全部 worker (断点已在 JSONL)", flush=True)
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+            for p in procs:
+                p.join(30)
+            for p in procs:
+                if p.is_alive():
+                    p.kill()
+            raise RuntimeError(f"[watchdog] {abort_reason}; "
+                               f"相同参数重跑即可断点续抽 ({tmp_dir})")
+        time.sleep(60)
+
+    for p in procs:
+        p.join()
+    bad = [w for w, p in enumerate(procs) if p.exitcode != 0]
+    if bad:
+        raise RuntimeError(f"worker {bad} 退出码非 0; 不写顶层 meta.json. "
+                           f"已完成样本记录在 {tmp_dir}, 相同参数重跑即可断点续抽")
+
+    # 合并 glob 全部 worker 文件 (含换 K 前的高编号残留文件, 其样本行仍有效);
+    # done 标记只可能来自本轮 (启动时历史标记已被重写清掉), 按 0..K-1 校验.
+    entries: dict[int, dict] = {}
+    failed = 0
+    dim = None
+    done_markers: set[int] = set()
+    for wp in sorted(tmp_dir.glob("worker_*.jsonl")):
+        with open(wp) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("done"):
+                    done_markers.add(e.get("worker_id", -1))
+                    dim = e["dim"]
+                elif "sample_idx" in e:
+                    prev = entries.get(e["sample_idx"])
+                    if prev is None or (prev.get("failed") and not e.get("failed")):
+                        entries[e["sample_idx"]] = e
+    missing = [w for w in range(K) if w not in done_markers]
+    if missing:
+        raise RuntimeError(f"worker {missing} manifest 无完成标记 (退出码 0 但未写完?)")
+    failed = sum(1 for e in entries.values() if e.get("failed"))
+    manifest = sorted((e for e in entries.values() if not e.get("failed")),
+                      key=lambda e: e["sample_idx"])
+    total_pairs = sum(e["M"] for e in manifest)
+
+    by_shard: dict[int, list[dict]] = {}
+    for e in manifest:
+        by_shard.setdefault(e["shard_idx"], []).append(e)
+    for shard_idx in range(num_shards):
+        entries = by_shard.get(shard_idx, [])
+        shard_dir = output_dir / f"shard_{shard_idx:04d}"
+        shard_dir.mkdir(exist_ok=True)
+        with open(shard_dir / "meta.json", "w") as f:
+            json.dump({"shard_idx": shard_idx, "num_samples": len(entries),
+                       "num_pairs": sum(e["M"] for e in entries),
+                       "sample_indices": [e["sample_idx"] for e in entries]}, f)
+
+    meta = {
+        "data_path": args.data_path, "data_format": args.data_format,
+        "model_path": args.model_path,
+        "N": (None if pool_ns else args.N), "dim": dim,
+        "pool_ns": (pool_ns or None), "hm_mode": getattr(args, "hm_mode", "floor"),
+        "save_dtype": args.save_dtype, "max_answer_tokens": args.max_answer_tokens,
+        "total_records": n_total, "succeeded": n_total - failed, "failed": failed,
+        "total_pairs": total_pairs, "num_shards": num_shards,
+        "has_lm_head": bool(args.dump_lm_head), "num_workers": K, "samples": manifest,
+    }
+    with open(output_dir / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    shutil.rmtree(tmp_dir)
+    print("=" * 72)
+    print(f"✅ Stage 0 完成: 成功 {meta['succeeded']}/{n_total}, 共 {total_pairs} (X, HQ_tea) 对")
 
 
 def _make_prompt(context: str, question: str) -> str:
@@ -564,9 +957,12 @@ def resolve_eos_ids(model) -> list[int]:
 
 def main():
     args = parse_args()
-    extractor = Stage0Extractor(args)
-    extractor.load_model()
-    extractor.run()
+    if args.num_workers > 1:
+        run_parallel(args)
+    else:
+        extractor = Stage0Extractor(args)
+        extractor.load_model()
+        extractor.run()
 
 
 if __name__ == "__main__":

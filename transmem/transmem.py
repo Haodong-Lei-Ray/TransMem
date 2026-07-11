@@ -64,6 +64,8 @@ class TransMemConfig:
     causal: bool = True            # 因果 mask(查询看历史) vs 全双向
     pos_mode: str = "rope"         # none | rope | learned (位置注入方式)
     n_mem: int = 4                 # 记忆分段数 N (query 槽从第 N 位开始)
+    hm_mode: str = "floor"         # HM 取位公式: floor=历史分段 | frac=分数取位(池化消融).
+                                   # 模型本身不用; 记录进 ckpt 供 rollout/evaluate 对齐 stage0
     max_queries: int = 256         # learned 位置 embedding 覆盖的最大 query 数 (长度 N+max_queries)
     final_norm: bool = True        # 读出前是否过 Qwen3RMSNorm
     zero_init_out: bool = True     # out_proj 零初始化 -> 初始 MS=0

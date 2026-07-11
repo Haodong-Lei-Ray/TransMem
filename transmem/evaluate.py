@@ -44,7 +44,8 @@ _DTYPE = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.
 def parse_args():
     p = argparse.ArgumentParser(description="TransMem 推理 + 长度外推评测")
     p.add_argument("--eval_file", required=True, help="评测数据 (json / qasper / parquet)")
-    p.add_argument("--data_format", default="json", choices=["json", "qasper", "parquet"])
+    p.add_argument("--data_format", default="json",
+                   choices=["json", "qasper", "parquet", "hotpotqa-agentmem"])
     p.add_argument("--model_path", required=True)
     p.add_argument("--mode", required=True, choices=["teacher", "student", "transmem"])
     p.add_argument("--ckpt", default=None, help="transmem 模式的 TransMem checkpoint")
@@ -119,7 +120,13 @@ class Evaluator:
             self.mem = TransMem(cfg).to(self.device, dtype=self.dtype)
             print("[WARN] transmem 模式未给 --ckpt, 用随机初始化 (仅调试)")
         self.mem.eval()
-        self.rollout = OnPolicyRollout(self.model, self.tok, self.device, a.N, self.dtype)
+        # rollout 的 N/取位公式跟随 ckpt config (老 ckpt 无 hm_mode 字段 -> floor),
+        # 与训练特征严格一致; --N 仅在无 ckpt 调试时生效.
+        hm_mode = getattr(cfg, "hm_mode", "floor")
+        if a.N != cfg.n_mem:
+            print(f"[INFO] rollout 用 ckpt 的 n_mem={cfg.n_mem}/hm_mode={hm_mode} (忽略 --N {a.N})")
+        self.rollout = OnPolicyRollout(self.model, self.tok, self.device, cfg.n_mem,
+                                       self.dtype, hm_mode=hm_mode)
 
     @torch.no_grad()
     def _greedy_plain(self, context: str, question: str) -> str:
