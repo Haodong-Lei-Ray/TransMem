@@ -50,6 +50,28 @@ from transmem.extract_features import (
 _DTYPE = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
+def _apply_hm_transform(hm: torch.Tensor, transform=None) -> torch.Tensor:
+    """Apply an optional diagnostic HM override without changing its contract."""
+
+    if transform is None:
+        return hm
+    transformed = transform(hm)
+    if not isinstance(transformed, torch.Tensor):
+        raise ValueError(
+            f"HM transform must return torch.Tensor, got {type(transformed).__name__}")
+    if transformed.shape != hm.shape:
+        raise ValueError(
+            f"HM transform changed shape from {tuple(hm.shape)} "
+            f"to {tuple(transformed.shape)}")
+    if transformed.dtype != hm.dtype:
+        raise ValueError(
+            f"HM transform changed dtype from {hm.dtype} to {transformed.dtype}")
+    if transformed.device != hm.device:
+        raise ValueError(
+            f"HM transform changed device from {hm.device} to {transformed.device}")
+    return transformed
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Stage 1 on-policy (OPD): TransMem 蒸馏")
     p.add_argument("--data_path", required=True)
@@ -118,7 +140,8 @@ class OnPolicyRollout:
 
     @torch.no_grad()
     def student_rollout(self, mem: TransMem, context_long: str, question: str,
-                        max_new: int, sample: bool, temperature: float):
+                        max_new: int, sample: bool, temperature: float,
+                        hm_transform=None):
         """学生在线 rollout (TransMem 在环, token-by-token).
 
         TransMem 与外层 LLM 各持一份 KV cache: 第 1 步喂 [HM_stu; HQ_stu_1] prefill,
@@ -143,6 +166,7 @@ class OnPolicyRollout:
             past = out.past_key_values
             prefill_hidden = store["h"][0]                       # [L, dim]
             hm_stu = self._extract_hm(prefill_hidden, len_cl)    # [N, dim]
+            hm_stu = _apply_hm_transform(hm_stu, hm_transform)
 
             hq_list, ans_ids = [], []
             hq_cur = prefill_hidden[-1:, :]                      # HQ_stu_1 [1,dim]

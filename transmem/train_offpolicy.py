@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -49,8 +50,56 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transmem import TransMemConfig, TransMem, DistillLoss, FrozenLMHead
+from transmem.diagnostics import parse_curve_steps
 
 _DTYPE = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+
+
+def curve_checkpoint_path(output_dir, step: int) -> Path:
+    return Path(output_dir) / f"curve_step_{int(step):07d}.pt"
+
+
+def save_curve_checkpoint(path: str | Path, *, model, config: dict,
+                          global_step: int, epoch: int, seed: int | None,
+                          schedule_total_steps: int) -> None:
+    """Atomically save a model-only checkpoint used by free-generation curves."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "config": config,
+        "global_step": int(global_step),
+        "epoch": int(epoch),
+        "kind": "curve",
+        "seed": seed,
+        "schedule_total_steps": int(schedule_total_steps),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(checkpoint, tmp)
+    os.replace(tmp, path)
+
+
+def seed_everything(seed: int | None) -> None:
+    """Seed model initialization and data-order RNGs when explicitly requested."""
+    if seed is None:
+        return
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_schedule_total_steps(total_steps: int,
+                                 requested_steps: int | None) -> int:
+    """Return a safe LR horizon that never ends before training stops."""
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be positive, got {total_steps}")
+    resolved = total_steps if requested_steps is None else int(requested_steps)
+    if resolved < total_steps:
+        raise ValueError(
+            "schedule_total_steps must be >= actual total_steps, "
+            f"got {resolved} < {total_steps}")
+    return resolved
 
 
 def setup_distributed():
@@ -99,13 +148,25 @@ def parse_args():
     p.add_argument("--val_interval", type=int, default=1000)
     p.add_argument("--save_interval", type=int, default=5000)
     p.add_argument("--max_steps", type=int, default=None)
+    p.add_argument("--schedule_total_steps", type=int, default=None,
+                   help="学习率调度总步数; 默认等于实际停止步数. 可让短跑沿用完整长跑 schedule")
+    p.add_argument("--curve_steps", nargs="*", default=None, metavar="STEP",
+                   help="保存 model-only 曲线快照(正整数步); step0 由 evaluator 的 student baseline 表示")
+    p.add_argument("--seed", type=int, default=None,
+                   help="显式固定模型初始化与数据顺序; 默认 None 保持历史随机行为")
     # 硬件
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     p.add_argument("--resume", default=None)
     p.add_argument("--overfit_batch", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    try:
+        spec = ",".join(args.curve_steps or [])
+        args.curve_steps = list(parse_curve_steps(spec))
+    except ValueError as exc:
+        p.error(str(exc))
+    return args
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -284,6 +345,9 @@ class OffPolicyTrainer:
         self.device = torch.device(args.device)
         self.train_dtype = _DTYPE[args.dtype]
 
+        # Seed before TransMem construction: fixed-seed curve reruns must share
+        # model initialization, not merely the data order.
+        seed_everything(getattr(args, "seed", None))
         self.config = TransMemConfig.from_json(args.config)
         assert self.config.causal, (
             "序列级 off-policy 训练依赖 causal mask (尾部 padding 不可见 + "
@@ -462,6 +526,23 @@ class OffPolicyTrainer:
             _asave(base, Path(path) / fn); names.append(f"{fn}(model-only)")
         print(f"  Checkpoint saved: {', '.join(names)} (step {self.global_step})")
 
+    def _maybe_save_curve_checkpoint(self, curve_steps: set[int],
+                                     schedule_total_steps: int) -> None:
+        """Save exactly requested curve points without touching ``latest.pt``."""
+        if not self.is_main or self.global_step not in curve_steps:
+            return
+        path = curve_checkpoint_path(self.args.output_dir, self.global_step)
+        save_curve_checkpoint(
+            path,
+            model=self.mem,
+            config=self.config.to_dict(),
+            global_step=self.global_step,
+            epoch=self.epoch,
+            seed=getattr(self.args, "seed", None),
+            schedule_total_steps=schedule_total_steps,
+        )
+        print(f"  Curve checkpoint saved: {path.name} (model-only)")
+
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.mem.load_state_dict(ckpt["model_state_dict"])
@@ -517,13 +598,30 @@ class OffPolicyTrainer:
             f"Stage0 数据 N={train_dl.dataset.N} != config n_mem={self.config.n_mem}: "
             f"forward 里 query 槽从第 n_mem 位切, 不一致会静默错位")
         total_steps = args.max_steps or (args.epochs * len(train_dl))
+        schedule_total_steps = resolve_schedule_total_steps(
+            total_steps, getattr(args, "schedule_total_steps", None))
+        requested_curve_steps = set(getattr(args, "curve_steps", None) or [])
+        curve_steps = {step for step in requested_curve_steps if step > 0}
         if self.is_main:
             print(f"\n训练: steps/epoch≈{len(train_dl)}, total≈{total_steps}, "
                   f"bs={args.batch_size} 序列/rank x {self.world} rank "
                   f"(全局 {args.batch_size * self.world} 序列/step, avg "
                   f"{train_dl.dataset.total_pairs / train_dl.dataset.num_samples:.1f} 位置/序列), "
                   f"lr={args.lr}, device={self.device}")
+            if schedule_total_steps != total_steps:
+                print(f"LR schedule: {schedule_total_steps} steps (实际停止于 {total_steps})")
+            if 0 in requested_curve_steps:
+                print("[INFO] 忽略 curve step 0; evaluator 用 student baseline 作为起点")
+            if curve_steps:
+                print(f"自由生成曲线快照: {sorted(curve_steps)}")
+                unreachable = sorted(step for step in curve_steps if step > total_steps)
+                if unreachable:
+                    print(f"[WARN] curve_steps 超过停止步数, 不会保存: {unreachable}")
             print("=" * 72)
+
+        # On resume, preserve the requested current positive step before the
+        # next optimizer update; fresh runs use the evaluator's student step 0.
+        self._maybe_save_curve_checkpoint(curve_steps, schedule_total_steps)
 
         if args.overfit_batch:
             X, hq_tea, ans, q_mask = next(iter(train_dl))
@@ -554,13 +652,14 @@ class OffPolicyTrainer:
             for X, hq_tea, ans, q_mask in train_dl:
                 if self.global_step >= total_steps:
                     break
-                self._set_lr(self.global_step, total_steps)
+                self._set_lr(self.global_step, schedule_total_steps)
                 X, hq_tea = X.to(self.device), hq_tea.to(self.device)
                 # 该步过后若触发 log, 就算上 baseline 诊断 (base_div/improve)
                 full = ((self.global_step + 1) % args.log_interval == 0)
                 m = self.train_step(X, hq_tea, ans, q_mask, full=full)
                 self.global_step += 1
                 running += m["loss"]
+                self._maybe_save_curve_checkpoint(curve_steps, schedule_total_steps)
                 if self.is_main and self.global_step % args.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
                     sps = args.log_interval / max(time.time() - t0, 1e-3)

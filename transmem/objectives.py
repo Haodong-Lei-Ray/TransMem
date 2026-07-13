@@ -140,7 +140,13 @@ class FrozenLMHead(nn.Module):
     def __init__(self, weight: torch.Tensor):
         super().__init__()
         vocab, dim = weight.shape
-        self.proj = nn.Linear(dim, vocab, bias=False)
+        self.proj = nn.Linear(
+            dim,
+            vocab,
+            bias=False,
+            device=weight.device,
+            dtype=weight.dtype,
+        )
         with torch.no_grad():
             self.proj.weight.copy_(weight)
         self.proj.weight.requires_grad_(False)
