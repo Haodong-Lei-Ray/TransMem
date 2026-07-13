@@ -61,7 +61,7 @@ def test_teacher_stops(model_path: str, record: str):
     ext.load_model()
 
     rec = load_records(record, "qasper", 1)[0]
-    answer_ids, answer_text, hq_tea = ext.generate_answer(rec["cs_text"], rec["question"])
+    answer_ids, answer_text, hq_tea, _ = ext.generate_answer(rec["cs_text"], rec["question"])
     AN = len(answer_ids)
 
     assert AN >= 1, "空答案"

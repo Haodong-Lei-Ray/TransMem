@@ -446,14 +446,20 @@ class OffPolicyTrainer:
             base["metrics"] = metrics
         # latest.pt 带 optimizer (断点续训需要); best/final 只存 model_state_dict —
         # 评测/推理够用, 省盘 (8B TransMem 含 optimizer 12.6G, 只存 model 4.2G).
-        torch.save(dict(base, optimizer_state_dict=self.optimizer.state_dict()),
-                   Path(path) / "latest.pt")
+        # 原子写 (tmp + os.replace): spot 抢占砍在写档中途不会留截断 zip
+        # (10218607 实测半截 latest.pt 让 requeue 断点重续全体崩).
+        def _asave(obj, p):
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            torch.save(obj, tmp)
+            os.replace(tmp, p)
+        _asave(dict(base, optimizer_state_dict=self.optimizer.state_dict()),
+               Path(path) / "latest.pt")
         names = ["latest.pt"]
         if kind == "best":
-            torch.save(base, Path(path) / "best.pt"); names.append("best.pt(model-only)")
+            _asave(base, Path(path) / "best.pt"); names.append("best.pt(model-only)")
         elif kind == "final":
             fn = f"step_{self.global_step:07d}.pt"
-            torch.save(base, Path(path) / fn); names.append(f"{fn}(model-only)")
+            _asave(base, Path(path) / fn); names.append(f"{fn}(model-only)")
         print(f"  Checkpoint saved: {', '.join(names)} (step {self.global_step})")
 
     def load(self, path):

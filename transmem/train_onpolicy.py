@@ -133,7 +133,13 @@ class OnPolicyRollout:
         store = {}
         handle = self._hook_norm(store)
         try:
-            out = self.model(input_ids=cq_ids, use_cache=True)
+            # 只跑 base model: CausalLM 会算全长 logits [L,vocab] (~9GB@30k, ~37GB@122k
+            # longmemeval 必 OOM), 而这里 logits 从不使用 (149 行手动过 lm_head).
+            # attention_mask=ones 显式传 (transformers 4.57.6: None 不走 is_causal skip,
+            # 物化 S×S mask, 125k 峰值 57.4GB vs 16.8GB — probe 10216593).
+            out = self.model.model(input_ids=cq_ids,
+                                   attention_mask=torch.ones_like(cq_ids),
+                                   use_cache=True)
             past = out.past_key_values
             prefill_hidden = store["h"][0]                       # [L, dim]
             hm_stu = self._extract_hm(prefill_hidden, len_cl)    # [N, dim]
@@ -156,8 +162,8 @@ class OnPolicyRollout:
                 ans_ids.append(tok_id)
                 if tok_id in self.eos_ids:
                     break
-                step = self.model(input_ids=nxt.view(1, 1), past_key_values=past,
-                                  use_cache=True)
+                step = self.model.model(input_ids=nxt.view(1, 1), past_key_values=past,
+                                        use_cache=True)
                 past = step.past_key_values
                 hq_cur = store["h"][0][-1:, :]                   # HQ_stu_{i+1}
                 X = hq_cur.unsqueeze(0).to(self.dtype)           # 增量: 只喂新查询 [1,1,dim]
@@ -182,7 +188,9 @@ class OnPolicyRollout:
         store = {}
         handle = self._hook_norm(store)
         try:
-            self.model(input_ids=full, use_cache=False)
+            # 同上: 不算全长 logits; ones mask 走 is_causal skip (避免 S×S mask 物化)
+            self.model.model(input_ids=full, attention_mask=torch.ones_like(full),
+                             use_cache=False)
         finally:
             handle.remove()
         hidden = store["h"][0]                                   # [total, dim]

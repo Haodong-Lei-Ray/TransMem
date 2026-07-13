@@ -62,7 +62,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Stage 0: 离线抽取 LLM hidden states (TransMem)")
     p.add_argument("--data_path", required=True, help="数据路径 (.parquet 或 .json)")
     p.add_argument("--data_format", default="parquet",
-                   choices=["parquet", "json", "qasper", "hotpotqa-agentmem"])
+                   choices=["parquet", "json", "qasper", "hotpotqa-agentmem", "longmemeval"])
     p.add_argument("--model_path", required=True, help="Qwen3-4B-Instruct-2507 路径")
     p.add_argument("--output_dir", required=True, help="输出目录, 写 sharded .pt + lm_head.pt")
     p.add_argument("--device", default="cuda:0")
@@ -81,6 +81,11 @@ def parse_args():
     p.add_argument("--manifest_dir", default=None,
                    help="worker manifest 目录 (默认 output_dir/.worker_manifests). "
                         "output_dir 在 s3mount 上时必须指到本地盘: JSONL 追加写对象存储不支持")
+    p.add_argument("--dump_layers", type=int, default=0,
+                   help="v3 计划 6 (transmem-layer): 额外抽 LLM 最后 K 个 decoder 层输出的 "
+                        "HM/HQ_stu/HQ_tea (每样本 hm_stu_layers [K,N,dim] / hq_{stu,tea}_layers "
+                        "[K,M,dim]), 并 dump final_norm.pt (顶层 KL 用). 0=关 (行为与旧版完全一致). "
+                        "与 --pool_ns 互斥")
     p.add_argument("--trajectory", default="teacher", choices=["teacher", "golden"],
                    help="轨迹来源: teacher=教师(C_S)rollout 当目标(off-policy KD, 默认); "
                         "golden=直接 teacher-force 数据集 golden 答案(SFT-on-golden, 无 teacher rollout, "
@@ -166,6 +171,8 @@ def load_records(data_path: str, data_format: str, max_samples: Optional[int]):
         return [_parse_parquet_row(df.iloc[i], i) for i in range(len(df))]
     if data_format == "hotpotqa-agentmem":
         return _load_hotpotqa_agentmem(data_path, max_samples)
+    if data_format == "longmemeval":
+        return _load_longmemeval(data_path, max_samples)
     with open(data_path) as f:
         raw = json.load(f)
     if data_format == "qasper":
@@ -267,6 +274,64 @@ def _load_hotpotqa_agentmem(data_path: str, max_samples: Optional[int]):
     if missing_golden > 0:
         print(f"  hotpotqa-agentmem: {missing_golden}/{len(records)} 条找不到 golden 标题")
     print(f"  hotpotqa-agentmem: {len(records)} 条已加载")
+    return records
+
+
+# ── LongMemEval-S: 多 session 聊天史; C_S=answer_session_ids 对应 session 并集 ──
+
+def _render_lme_session(sess: list, date: str) -> str:
+    """一个 session 渲染成 '[Session time: ...]\\nUser: ...\\nAssistant: ...' 文本.
+    时间戳必须保留: 133/470 是 temporal-reasoning 题."""
+    lines = [f"[Session time: {date}]" if date else "[Session]"]
+    for turn in sess:
+        role = str(turn.get("role", "user")).strip().capitalize() or "User"
+        content = str(turn.get("content", "")).strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _load_longmemeval(data_path: str, max_samples: Optional[int]):
+    """加载 longmemeval_{train,dev}.json (原 schema).
+    C_L = 全部 haystack session 顺序拼接 (~122k token, 位置=时间序);
+    C_S = answer_session_ids 命中的 session 并集 (hotpotqa 单 golden 事故教训:
+          knowledge-update 等题有多个证据 session, 必须全取);
+    Q   = question 前缀 (Current date: question_date) —— temporal 题需要今天日期."""
+    with open(data_path) as f:
+        raw = json.load(f)
+    if max_samples:
+        raw = raw[:max_samples]
+    records = []
+    n_no_ev = 0
+    for i, item in enumerate(raw):
+        sessions = item.get("haystack_sessions") or []
+        sids = item.get("haystack_session_ids") or []
+        dates = item.get("haystack_dates") or []
+        ans_ids = set(item.get("answer_session_ids") or [])
+        rendered, evid = [], []
+        for j, sess in enumerate(sessions):
+            date = dates[j] if j < len(dates) else ""
+            txt = _render_lme_session(sess, date)
+            rendered.append(txt)
+            if j < len(sids) and sids[j] in ans_ids:
+                evid.append(txt)
+        q = str(item.get("question", "")).strip()
+        qd = str(item.get("question_date", "")).strip()
+        if not evid:
+            n_no_ev += 1
+        records.append({
+            "question": f"(Current date: {qd}) {q}" if qd else q,
+            "context": "\n\n".join(rendered).strip(),
+            "cs_text": "\n\n".join(evid).strip(),
+            "golden_index": None,
+            "ground_truth": str(item.get("answer", "")).strip(),
+            "sample_idx": i,
+            "question_id": item.get("question_id", ""),
+            "question_type": item.get("question_type", ""),
+        })
+    if n_no_ev:
+        print(f"  longmemeval: {n_no_ev}/{len(records)} 条证据 session 为空 (将被跳过)")
+    print(f"  longmemeval: {len(records)} 条已加载")
     return records
 
 
@@ -380,6 +445,9 @@ class Stage0Extractor:
         self.pool_ns = _parse_pool_ns(args)
         if self.pool_ns:
             assert self.hm_mode == "frac", "--pool_ns 依赖 frac 取位的嵌套性, 须 --hm_mode frac"
+        self.dump_layers = int(getattr(args, "dump_layers", 0) or 0)
+        assert not (self.dump_layers and self.pool_ns), "--dump_layers 与 --pool_ns 互斥"
+        self.layer_ids: list[int] = []      # load_model 后按模型层数填充
 
     def load_model(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -403,6 +471,11 @@ class Stage0Extractor:
         self.dim = self.model.config.hidden_size
         self.lm_head = self.model.lm_head
         self._eos_ids = resolve_eos_ids(self.model)
+        if self.dump_layers:
+            n_layers = len(self.model.model.layers)
+            assert self.dump_layers <= n_layers, (self.dump_layers, n_layers)
+            self.layer_ids = list(range(n_layers - self.dump_layers, n_layers))
+            print(f"  dump_layers={self.dump_layers} -> layer_ids={self.layer_ids}")
         print(f"  dim={self.dim}, 设备={self.device}, eos_ids={self._eos_ids}")
 
     def dump_lm_head(self, output_dir: Path):
@@ -422,6 +495,38 @@ class Stage0Extractor:
                     output_dir / "lm_head.pt")
         print(f"  dump lm_head.pt: weight{tuple(w.shape)} tied={tied}")
 
+    def dump_final_norm(self, output_dir: Path):
+        """dump 冻结 final RMSNorm 权重 (transmem-layer 顶层 KL: 层输出→final_norm→lm_head)."""
+        target = output_dir / "final_norm.pt"
+        try:
+            if target.exists() and target.stat().st_size > 1000:
+                print("  final_norm.pt 已存在, 跳过 dump")
+                return
+        except OSError:
+            pass
+        norm = self.model.model.norm
+        atomic_save({"weight": norm.weight.detach().float().cpu(),
+                     "eps": float(getattr(norm, "variance_epsilon", 1e-6))}, target)
+        print(f"  dump final_norm.pt: weight{tuple(norm.weight.shape)}")
+
+    def _register_layer_hooks(self, captured: dict, last_only: bool):
+        """在 layer_ids 各层挂 forward hook.
+        last_only=True: 每次前向追加末位 hidden [dim] (教师 generate 逐步捕获);
+        last_only=False: 存整段 hidden [S, dim] (学生单次 teacher-forcing 前向).
+        返回 handles (调用方负责 remove)."""
+        handles = []
+        for l in self.layer_ids:
+            def mk(lid):
+                def hook_fn(m, inp, out):
+                    h = out[0] if isinstance(out, tuple) else out    # [B, S, dim]
+                    if last_only:
+                        captured.setdefault(lid, []).append(h[0, -1, :].detach())
+                    else:
+                        captured[lid] = h[0].detach()
+                return hook_fn
+            handles.append(self.model.model.layers[l].register_forward_hook(mk(l)))
+        return handles
+
     # ── 教师生成答案 + 顺带捕获 HQ_tea_i (无需二次 forward) ──────────────
     @torch.inference_mode()
     def generate_answer(self, cs_text: str, question: str):
@@ -435,6 +540,9 @@ class Stage0Extractor:
         def hook_fn(m, inp, out):
             captured.append(out[0, -1, :].detach())     # 末位 = 下一 token 的预测隐状态
         handle = self.model.model.norm.register_forward_hook(hook_fn)
+        layer_caps: dict[int, list[torch.Tensor]] = {}
+        layer_handles = (self._register_layer_hooks(layer_caps, last_only=True)
+                         if self.dump_layers else [])
         try:
             generated = self.model.generate(
                 input_ids=cq_ids, attention_mask=torch.ones_like(cq_ids),
@@ -443,6 +551,8 @@ class Stage0Extractor:
                 eos_token_id=self._eos_ids)          # chat 模式: 答完吐 <|im_end|> 自然停
         finally:
             handle.remove()
+            for hd in layer_handles:
+                hd.remove()
 
         answer_ids = generated[0, prompt_len:].tolist()
         answer_text = self.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
@@ -452,7 +562,13 @@ class Stage0Extractor:
         else:
             hq_tea = (torch.stack(captured, dim=0) if captured
                       else torch.empty(0, self.dim, device=self.device))
-        return answer_ids, answer_text, hq_tea
+        hq_tea_layers = None
+        if self.dump_layers:
+            m_eff = hq_tea.shape[0]
+            hq_tea_layers = torch.stack(
+                [torch.stack(layer_caps[l][:m_eff], dim=0) for l in self.layer_ids],
+                dim=0)                                   # [K, M, dim]
+        return answer_ids, answer_text, hq_tea, hq_tea_layers
 
     # ── 学生 forward: HM_stu + HQ_stu_i ──────────────────────────────
     @torch.inference_mode()
@@ -468,14 +584,18 @@ class Stage0Extractor:
                                 add_special_tokens=False).input_ids.to(self.device)
         len_cl = cl_ids.shape[1]
 
+        layer_store: Optional[dict] = {} if self.dump_layers else None
         if M <= 1:
-            hidden = self._forward_ids_and_hook(cq_ids)
+            hidden = self._forward_ids_and_hook(cq_ids, layer_store)
             hm, hm_extras = self._extract_hm(hidden, len_cl)
+            if self.dump_layers:
+                self._pack_layer_feats(layer_store, len_cl,
+                                       [hidden.shape[0] - 1], hm_extras)
             return hm, hidden[-1:, :], hm_extras
 
         prefix_ids = torch.tensor([answer_ids[:-1]], device=self.device, dtype=cq_ids.dtype)
         full_ids = torch.cat([cq_ids, prefix_ids], dim=1)
-        hidden = self._forward_ids_and_hook(full_ids)
+        hidden = self._forward_ids_and_hook(full_ids, layer_store)
         total_len = hidden.shape[0]
         hm, hm_extras = self._extract_hm(hidden, len_cl)
 
@@ -487,7 +607,24 @@ class Stage0Extractor:
             else:
                 break
         hq = hidden[torch.tensor(positions, device=hidden.device, dtype=torch.long)]
+        if self.dump_layers:
+            self._pack_layer_feats(layer_store, len_cl, positions, hm_extras)
         return hm, hq, hm_extras
+
+    def _pack_layer_feats(self, layer_store: dict, len_cl: int,
+                          positions: list[int], extras: dict) -> None:
+        """把各层整段 hidden 切成 HM 槽 + 查询位, 塞进 extras (随 hm_extras 流入样本 .pt).
+        取位与 final-norm 侧完全一致 (同 hm_positions / 同 positions)."""
+        idx = hm_positions(len_cl, self.N, self.hm_mode)
+        hm_layers, hq_layers = [], []
+        for l in self.layer_ids:
+            h = layer_store[l]                            # [S, dim]
+            idx_t = torch.tensor(idx, device=h.device, dtype=torch.long)
+            pos_t = torch.tensor(positions, device=h.device, dtype=torch.long)
+            hm_layers.append(h[idx_t])
+            hq_layers.append(h[pos_t])
+        extras["hm_stu_layers"] = torch.stack(hm_layers, dim=0)   # [K, N, dim]
+        extras["hq_stu_layers"] = torch.stack(hq_layers, dim=0)   # [K, M, dim]
 
     def _extract_hm(self, hidden: torch.Tensor, len_cl: int):
         """C_L 前 len_cl 个位置取记忆槽 hidden.
@@ -514,14 +651,24 @@ class Stage0Extractor:
         idx = hm_positions(len_cl, self.N, self.hm_mode)
         return hidden[torch.tensor(idx, device=hidden.device, dtype=torch.long)], {}
 
-    def _forward_ids_and_hook(self, ids: torch.Tensor) -> torch.Tensor:
+    def _forward_ids_and_hook(self, ids: torch.Tensor,
+                              layer_store: Optional[dict] = None) -> torch.Tensor:
         captured = {}
         def hook_fn(m, inp, out): captured["h"] = out.detach()
-        handle = self.model.model.norm.register_forward_hook(hook_fn)
+        handles = [self.model.model.norm.register_forward_hook(hook_fn)]
+        if layer_store is not None and self.dump_layers:
+            handles += self._register_layer_hooks(layer_store, last_only=False)
         try:
-            self.model(input_ids=ids, use_cache=False)
+            # 只跑 base model, 不过 lm_head: 全长 logits [L,151936] 在 122k 上下文
+            # (longmemeval) 是 ~37GB, 必 OOM; hook 挂在 model.model.norm 上照常触发.
+            # attention_mask=ones 必须显式传: 本 venv (transformers 4.57.6) mask=None 时
+            # 不走 is_causal skip, 会物化 S×S 因果 mask (125k 实测峰值 57.4GB vs 16.8GB,
+            # 见 probe_longctx_mem.py, job 10216593), longmemeval 长样本必 OOM.
+            self.model.model(input_ids=ids, attention_mask=torch.ones_like(ids),
+                             use_cache=False)
         finally:
-            handle.remove()
+            for hd in handles:
+                hd.remove()
         return captured["h"][0]
 
     # ── 单样本处理 ────────────────────────────────────────────────────
@@ -533,6 +680,7 @@ class Stage0Extractor:
             sample_idx = rec["sample_idx"]
             if not question or not context_long:
                 return None
+            hq_tea_layers = None
             if self.trajectory == "golden":
                 # SFT-on-golden: 直接 teacher-force 数据集 golden 答案, 不做 teacher rollout,
                 # 规避 "教师看 evidence 生成的答案是脏的" 问题; answer_ids=golden 供 CE loss.
@@ -556,7 +704,8 @@ class Stage0Extractor:
                 if not cs_text:
                     print(f"  [WARN] sample {sample_idx}: C_S 为空 (golden_index={golden_index})")
                     return None
-                answer_ids, answer_text, hq_tea = self.generate_answer(cs_text, question)
+                answer_ids, answer_text, hq_tea, hq_tea_layers = \
+                    self.generate_answer(cs_text, question)
                 if len(answer_ids) == 0:
                     return None
                 hm_stu, hq_stu, hm_extras = self.student_forward(context_long, question, answer_ids)
@@ -574,6 +723,14 @@ class Stage0Extractor:
                 "M": actual_M, "dim": self.dim,
                 "N": (None if self.pool_ns else self.N),
             }
+            if self.dump_layers:
+                hqsl = hm_extras.pop("hq_stu_layers")[:, :actual_M]
+                hqtl = (hqsl if hq_tea_layers is None
+                        else hq_tea_layers[:, :actual_M])   # golden 轨迹: dummy 同形
+                out["hm_stu_layers"] = hm_extras.pop("hm_stu_layers").to(self.save_dtype).cpu()
+                out["hq_stu_layers"] = hqsl.to(self.save_dtype).cpu()
+                out["hq_tea_layers"] = hqtl.to(self.save_dtype).cpu()
+                out["layer_ids"] = list(self.layer_ids)
             out.update(hm_extras)     # 池化: hm_pos / hm_maps / len_cl
             return out
         except Exception as e:
@@ -588,6 +745,8 @@ class Stage0Extractor:
         output_dir.mkdir(parents=True, exist_ok=True)
         if args.dump_lm_head:
             self.dump_lm_head(output_dir)
+        if self.dump_layers:
+            self.dump_final_norm(output_dir)
 
         records = load_records(args.data_path, args.data_format, args.max_samples)
         n_total = len(records)
@@ -635,6 +794,8 @@ class Stage0Extractor:
             "model_path": args.model_path,
             "N": (None if self.pool_ns else args.N), "dim": self.dim,
             "pool_ns": (self.pool_ns or None), "hm_mode": self.hm_mode,
+            "dump_layers": (self.dump_layers or None),
+            "layer_ids": (self.layer_ids or None),
             "save_dtype": args.save_dtype, "max_answer_tokens": args.max_answer_tokens,
             "total_records": n_total, "succeeded": n_total - failed, "failed": failed,
             "total_pairs": total_pairs, "num_shards": num_shards,
@@ -692,6 +853,8 @@ def _worker_entry(worker_id: int, args, records: list, manifest_path: str,
     output_dir = Path(args.output_dir)
     if worker_id == 0 and args.dump_lm_head:
         extractor.dump_lm_head(output_dir)
+    if worker_id == 0 and extractor.dump_layers:
+        extractor.dump_final_norm(output_dir)
 
     # 上次崩溃可能留下无换行的半行, 先补换行, 避免新条目黏连坏掉
     if os.path.exists(manifest_path) and os.path.getsize(manifest_path) > 0:
@@ -728,7 +891,8 @@ def _worker_entry(worker_id: int, args, records: list, manifest_path: str,
                 gc.collect()
                 torch.cuda.empty_cache()
         mf.write(json.dumps({"done": True, "worker_id": worker_id,
-                             "dim": extractor.dim}) + "\n")
+                             "dim": extractor.dim,
+                             "layer_ids": (extractor.layer_ids or None)}) + "\n")
 
 
 def run_parallel(args):
@@ -763,6 +927,10 @@ def run_parallel(args):
                    "max_answer_tokens": args.max_answer_tokens,
                    "thinking": bool(args.thinking),
                    "n_total": n_total}
+    # 条件键: 只在开启时进指纹 — 保证旧 run (无此参数) 的指纹逐字节不变,
+    # 正在跑/续抽中的作业升级代码后仍能无损断点续抽.
+    if int(getattr(args, "dump_layers", 0) or 0):
+        fingerprint["dump_layers"] = int(args.dump_layers)
     fp_path = tmp_dir / "run_config.json"
     if tmp_dir.exists():
         old_fp = None
@@ -853,6 +1021,7 @@ def run_parallel(args):
     entries: dict[int, dict] = {}
     failed = 0
     dim = None
+    layer_ids = None
     done_markers: set[int] = set()
     for wp in sorted(tmp_dir.glob("worker_*.jsonl")):
         with open(wp) as f:
@@ -864,6 +1033,7 @@ def run_parallel(args):
                 if e.get("done"):
                     done_markers.add(e.get("worker_id", -1))
                     dim = e["dim"]
+                    layer_ids = e.get("layer_ids") or layer_ids
                 elif "sample_idx" in e:
                     prev = entries.get(e["sample_idx"])
                     if prev is None or (prev.get("failed") and not e.get("failed")):
@@ -893,6 +1063,8 @@ def run_parallel(args):
         "model_path": args.model_path,
         "N": (None if pool_ns else args.N), "dim": dim,
         "pool_ns": (pool_ns or None), "hm_mode": getattr(args, "hm_mode", "floor"),
+        "dump_layers": (int(getattr(args, "dump_layers", 0) or 0) or None),
+        "layer_ids": layer_ids,
         "save_dtype": args.save_dtype, "max_answer_tokens": args.max_answer_tokens,
         "total_records": n_total, "succeeded": n_total - failed, "failed": failed,
         "total_pairs": total_pairs, "num_shards": num_shards,

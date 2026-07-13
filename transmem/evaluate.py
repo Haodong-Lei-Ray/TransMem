@@ -45,7 +45,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="TransMem 推理 + 长度外推评测")
     p.add_argument("--eval_file", required=True, help="评测数据 (json / qasper / parquet)")
     p.add_argument("--data_format", default="json",
-                   choices=["json", "qasper", "parquet", "hotpotqa-agentmem"])
+                   choices=["json", "qasper", "parquet", "hotpotqa-agentmem", "longmemeval"])
     p.add_argument("--model_path", required=True)
     p.add_argument("--mode", required=True, choices=["teacher", "student", "transmem"])
     p.add_argument("--ckpt", default=None, help="transmem 模式的 TransMem checkpoint")
@@ -110,7 +110,21 @@ class Evaluator:
         a = self.args
         if a.ckpt:
             ckpt = torch.load(a.ckpt, map_location="cpu", weights_only=False)
-            cfg = TransMemConfig(**ckpt["config"])
+            cfg_dict = ckpt["config"]
+            if isinstance(cfg_dict, dict) and cfg_dict.get("layered"):
+                # v3 计划 6: TransMem-Layer ckpt (config 带 layered=true) 自动分发
+                from transmem.layered import (LayeredConfig, TransMemLayered,
+                                              LayeredRollout)
+                lcfg = LayeredConfig.from_dict(cfg_dict)
+                self.mem = TransMemLayered(lcfg).to(self.device, dtype=self.dtype)
+                self.mem.load_state_dict(ckpt["model_state_dict"])
+                self.mem.eval()
+                self.rollout = LayeredRollout(self.model, self.tok, self.device,
+                                              self.mem, self.dtype)
+                print(f"加载 TransMemLayered: {a.ckpt} (step={ckpt.get('global_step')}, "
+                      f"inject_layers={lcfg.inject_layers})")
+                return
+            cfg = TransMemConfig(**cfg_dict)
             self.mem = TransMem(cfg).to(self.device, dtype=self.dtype)
             self.mem.load_state_dict(ckpt["model_state_dict"])
             print(f"加载 TransMem: {a.ckpt} (step={ckpt.get('global_step')})")
