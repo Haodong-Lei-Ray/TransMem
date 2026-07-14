@@ -1,0 +1,28 @@
+{
+  "_comment": "TransMem-Layer: 每个注入层一个 1 层 Qwen3-block TransMem. 块架构对齐 Qwen3-4B-Instruct-2507; inject_layers 由 train_inloop --D/--S 或 --inject_layers 覆盖.",
+
+  "dim": 2560,
+  "block_depth": 1,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 9728,
+  "rms_norm_eps": 1e-6,
+  "rope_theta": 5000000.0,
+  "max_position_embeddings": 262144,
+  "initializer_range": 0.02,
+  "attn_impl": "sdpa",
+
+  "causal": true,
+  "pos_mode": "rope",
+  "n_mem": 4,
+  "hm_mode": "floor",
+  "max_queries": 256,
+  "final_norm": true,
+  "zero_init_out": true,
+
+  "a_init": 1.0,
+  "learnable_a": false,
+
+  "inject_layers": [35]
+}

@@ -33,7 +33,7 @@ DDP: 注入发生在 LLM hook 内逐块调用, 绕不开 DDP reducer 的单 forw
     --data_format hotpotqa-agentmem \
     --val_data_dir .../stage0_dev_short200 --val_data_path .../hotpotqa_dev.parquet \
     --model_path <Qwen3-4B> --config transmem/config_layered.json \
-    --D 8 --policy tf --output_dir checkpoints/v3_2_inloop_tf_d8
+    --D 4 --S 32 --policy tf --output_dir checkpoints/v4_inloop_s32_d4
 """
 
 from __future__ import annotations
@@ -54,7 +54,12 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transmem import DistillLoss
-from transmem.layered import LayeredConfig, TransMemLayered, LayeredRollout
+from transmem.layered import (
+    LayeredConfig,
+    LayeredRollout,
+    TransMemLayered,
+    resolve_inject_layers,
+)
 from transmem.extract_features import load_records, build_chat_prompt_ids
 from transmem.train_offpolicy import setup_distributed
 
@@ -73,7 +78,13 @@ def parse_args():
     p.add_argument("--model_path", required=True)
     p.add_argument("--attn_impl", default="sdpa")
     p.add_argument("--config", default="transmem/config_layered.json")
-    p.add_argument("--D", type=int, default=None, help="注入 LLM 最后 D 层")
+    p.add_argument("--D", type=int, default=None, help="注入窗口深度")
+    p.add_argument(
+        "--S",
+        type=int,
+        default=None,
+        help="注入窗口的独占上界; S=32,D=4 表示层 28..31（默认取 LLM 总层数）",
+    )
     p.add_argument("--inject_layers", default=None, help="显式层号, 逗号分隔 (0-based)")
     # 目标
     p.add_argument("--policy", default="tf", choices=["tf", "onpolicy"])
@@ -190,13 +201,12 @@ class InLoopTrainer:
         self.model.requires_grad_(False)
         n_layers = len(self.model.model.layers)
 
-        if args.inject_layers:
-            inject = sorted(int(x) for x in args.inject_layers.split(","))
-        elif args.D:
-            assert args.D <= n_layers
-            inject = list(range(n_layers - args.D, n_layers))
-        else:
-            raise ValueError("需要 --D 或 --inject_layers")
+        inject = resolve_inject_layers(
+            n_layers=n_layers,
+            depth=args.D,
+            stop=getattr(args, "S", None),
+            explicit=args.inject_layers or None,
+        )
         cfg = LayeredConfig.from_json(args.config)
         cfg.inject_layers = inject
         cfg.__post_init__()

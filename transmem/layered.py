@@ -1,4 +1,4 @@
-"""TransMem-Layer (v3 计划 6): 冻结 LLM 的最后 D 个 decoder 层各插一个 1 层 TransMem.
+"""TransMem-Layer: 冻结 LLM 的指定 D 个 decoder 层各插一个 1 层 TransMem.
 
 与原 TransMem (final-hidden 单点偏置) 的区别: 偏置注入发生在 LLM 层栈**内部** —
 第 l 层输出的查询位 hidden 被 `h + a*MS^l` 纠正后才进入第 l+1 层, 使记忆纠正参与
@@ -35,13 +35,70 @@ from .transmem import TransMemConfig, TransMem
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 注入窗口
+# ═══════════════════════════════════════════════════════════════════════
+
+def resolve_inject_layers(
+    n_layers: int,
+    depth: int | None = None,
+    stop: int | None = None,
+    explicit: str | list[int] | tuple[int, ...] | None = None,
+) -> list[int]:
+    """Resolve the 0-based LLM layers that receive TransMem blocks.
+
+    ``stop`` is an exclusive upper bound.  For example, a 36-layer model with
+    ``depth=4, stop=32`` injects layers ``[28, 29, 30, 31]``.  Omitting
+    ``stop`` preserves the original behavior of injecting the final ``depth``
+    layers.  ``explicit`` remains available for non-contiguous ablations.
+    """
+    if n_layers <= 0:
+        raise ValueError(f"n_layers 必须为正数，收到 {n_layers}")
+
+    if explicit is not None:
+        if depth is not None or stop is not None:
+            raise ValueError("explicit 与 depth/stop 二选一")
+        if isinstance(explicit, str):
+            values = [part.strip() for part in explicit.split(",") if part.strip()]
+        else:
+            values = list(explicit)
+        if not values:
+            raise ValueError("explicit 注入层不能为空")
+        try:
+            layers = [int(value) for value in values]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"explicit 注入层必须为整数: {explicit!r}") from exc
+        if len(set(layers)) != len(layers):
+            raise ValueError(f"explicit 注入层不能重复: {layers}")
+        if any(layer < 0 or layer >= n_layers for layer in layers):
+            raise ValueError(
+                f"explicit 注入层超出合法范围 [0, {n_layers}): {layers}"
+            )
+        return sorted(layers)
+
+    if depth is None:
+        raise ValueError("depth 必填（或改用 explicit）")
+    if depth <= 0:
+        raise ValueError(f"depth 必须为正数，收到 {depth}")
+    resolved_stop = n_layers if stop is None else stop
+    if resolved_stop <= 0 or resolved_stop > n_layers:
+        raise ValueError(
+            f"stop 必须在合法范围 [1, {n_layers}]，收到 {resolved_stop}"
+        )
+    if depth > resolved_stop:
+        raise ValueError(
+            f"depth={depth} 不能大于 stop={resolved_stop}，否则窗口越过第 0 层"
+        )
+    return list(range(resolved_stop - depth, resolved_stop))
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 配置
 # ═══════════════════════════════════════════════════════════════════════
 
 @dataclass
 class LayeredConfig:
     """块架构字段与 TransMemConfig 对齐 (每块 depth=block_depth, 默认 1 层);
-    inject_layers = 注入的 LLM decoder 层号 (0-based, 升序, 最后 D 层)."""
+    inject_layers = 注入的 LLM decoder 层号 (0-based, 升序)."""
 
     dim: int = 2560
     block_depth: int = 1
