@@ -23,6 +23,13 @@ _GATE_CONFIG_FIELDS = {
 _NON_STRUCTURAL_FIELDS = _GATE_CONFIG_FIELDS | {"warm_start"}
 
 
+def _atomic_torch_save(payload: object, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, destination)
+
+
 def _normalized_config(module: nn.Module, values: Mapping[str, object]) -> dict:
     """Fill legacy defaults with the config class used by the target module."""
     config_type = type(module.config)  # type: ignore[attr-defined]
@@ -101,6 +108,47 @@ def load_legacy_gate_state(
     return result
 
 
+def materialize_migrated_gate_checkpoint(
+    module: nn.Module,
+    dst_ckpt: str | Path,
+    *,
+    parent_checkpoint: str,
+    gate_calibration_steps: int,
+    joint_finetune_steps: int | None,
+    seed: int | None,
+) -> Path:
+    """Persist an in-memory migration, then prove it strict-loads before training."""
+    destination = Path(dst_ckpt).expanduser().resolve()
+    config = module.config.to_dict()  # type: ignore[attr-defined]
+    metadata = {
+        "config": config,
+        "train_mode": "migrated_legacy_gate",
+        "init_scheme": "legacy_gate",
+        "parent_checkpoint": str(Path(parent_checkpoint).expanduser().resolve()),
+        "gate_calibration_steps": int(gate_calibration_steps),
+        "joint_finetune_steps": joint_finetune_steps,
+        "seed": seed,
+        "global_step": 0,
+        "epoch": 0,
+        "kind": "migrated_init",
+    }
+    if destination.exists():
+        checkpoint = torch.load(destination, map_location="cpu", weights_only=False)
+        mismatches = [
+            f"{name}: checkpoint={checkpoint.get(name)!r}, current={value!r}"
+            for name, value in metadata.items() if checkpoint.get(name) != value
+        ]
+        if mismatches:
+            raise ValueError(
+                "已有 migrated_init.pt 与当前迁移请求不一致:\n  - "
+                + "\n  - ".join(mismatches))
+    else:
+        checkpoint = dict(metadata, model_state_dict=module.state_dict())
+        _atomic_torch_save(checkpoint, destination)
+    module.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    return destination
+
+
 def migrate_legacy_checkpoint(
     src_ckpt: str | Path,
     dst_ckpt: str | Path,
@@ -153,7 +201,4 @@ def migrate_legacy_checkpoint(
         "global_step": 0,
         "epoch": 0,
     }
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    torch.save(migrated, temporary)
-    os.replace(temporary, destination)
+    _atomic_torch_save(migrated, destination)

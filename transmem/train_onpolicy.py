@@ -44,7 +44,10 @@ from transformers.cache_utils import DynamicCache
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transmem import TransMemConfig, TransMem, DistillLoss
-from transmem.checkpoints import load_legacy_gate_state
+from transmem.checkpoints import (
+    load_legacy_gate_state,
+    materialize_migrated_gate_checkpoint,
+)
 from transmem.extract_features import (
     load_records, extract_cs, build_chat_prompt_ids, resolve_eos_ids, hm_positions)
 from transmem.gate_training import (
@@ -301,6 +304,7 @@ class OnPolicyTrainer:
         )
         self.mem = TransMem(self.config).to(self.device, dtype=self.dtype)
         self.parent_checkpoint = None
+        self._legacy_regression_pending = False
         if args.init_scheme == "legacy_gate":
             if self.config.warm_start:
                 raise ValueError("legacy_gate 与 warm_start=true 冲突")
@@ -309,6 +313,20 @@ class OnPolicyTrainer:
             load_legacy_gate_state(self.mem, checkpoint)
             self.parent_checkpoint = str(Path(args.init_checkpoint).expanduser().resolve())
             del checkpoint
+            migrated_path = Path(args.output_dir) / "migrated_init.pt"
+            materialize_migrated_gate_checkpoint(
+                self.mem,
+                migrated_path,
+                parent_checkpoint=self.parent_checkpoint,
+                gate_calibration_steps=args.gate_calibration_steps,
+                joint_finetune_steps=args.joint_finetune_steps,
+                seed=getattr(args, "seed", None),
+            )
+            migrated = torch.load(
+                migrated_path, map_location="cpu", weights_only=False)
+            self.mem.load_state_dict(migrated["model_state_dict"], strict=True)
+            del migrated
+            self._legacy_regression_pending = True
         elif self.config.warm_start:
             self.mem.warm_start_from(self.model)
         self.rollout = OnPolicyRollout(self.model, self.tokenizer, self.device,
@@ -319,6 +337,9 @@ class OnPolicyTrainer:
             self.mem, base_lr=args.lr, gate_lr=args.gate_lr,
             weight_decay=args.weight_decay)
         self.global_step = 0
+        self.joint_phase_initialized = not (
+            args.init_scheme == "legacy_gate"
+            and args.gate_calibration_steps > 0)
         self.writer = SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
         print(f"TransMem: {self.mem.num_params(True):,} trainable | "
               f"loss={args.divergence} T={args.temperature} | "
@@ -383,6 +404,18 @@ class OnPolicyTrainer:
         proposal = self.mem(X, return_all_queries=True)
         hq_prime = self.mem.correct(hq_stu.unsqueeze(0), proposal).squeeze(0)
         student_logits = self.lm_head(hq_prime)                 # [AN, vocab]
+        if self._legacy_regression_pending:
+            with torch.no_grad():
+                if not torch.equal(proposal.gate, torch.ones_like(proposal.gate)):
+                    raise RuntimeError("legacy_gate step-0 回归失败: gate 不严格等于 1")
+                legacy_hidden = hq_stu.unsqueeze(0) + proposal.ms.to(hq_stu.dtype)
+                legacy_logits = self.lm_head(legacy_hidden.squeeze(0))
+                if not torch.equal(student_logits.detach(), legacy_logits):
+                    error = float((student_logits.detach() - legacy_logits).abs().max())
+                    raise RuntimeError(
+                        f"legacy_gate step-0 logits 回归失败: max_error={error:.3e}")
+            self._legacy_regression_pending = False
+            print("legacy_gate step-0 logits regression: PASS")
         task_loss, metrics = self.loss_fn(
             student_logits, teacher_logits, hq_prime, hq_tea)
         prior = gate_prior_loss(proposal.gate)
@@ -416,6 +449,12 @@ class OnPolicyTrainer:
         records = load_records(args.data_path, args.data_format, args.max_samples)
         print(f"数据: {len(records)} 条; 目标 {args.max_steps} steps")
         print("=" * 72)
+
+        if (args.init_scheme == "legacy_gate"
+                and args.gate_calibration_steps > 0
+                and self.global_step >= args.gate_calibration_steps
+                and not self.joint_phase_initialized):
+            self._start_joint_phase()
 
         ri = 0
         running = {"loss": 0.0, "div": 0.0}
@@ -453,6 +492,7 @@ class OnPolicyTrainer:
                         and args.gate_calibration_steps > 0
                         and self.global_step == args.gate_calibration_steps):
                     self.save(args.output_dir, kind="calibrated")
+                    self._start_joint_phase()
                 if self.global_step % args.log_interval == 0:
                     lrs = {group.get("group_name", "base"): group["lr"]
                            for group in self.optimizer.param_groups}
@@ -500,7 +540,8 @@ class OnPolicyTrainer:
                 "gate_calibration_steps": self.args.gate_calibration_steps,
                 "joint_finetune_steps": getattr(
                     self, "resolved_joint_finetune_steps",
-                    self.args.joint_finetune_steps)}
+                    self.args.joint_finetune_steps),
+                "joint_phase_initialized": self.joint_phase_initialized}
         torch.save(base, Path(path) / f"step_{self.global_step:07d}.pt")
         torch.save(dict(base, optimizer_state_dict=self.optimizer.state_dict()),
                    Path(path) / "latest.pt")
@@ -522,10 +563,38 @@ class OnPolicyTrainer:
             seed=getattr(self.args, "seed", None),
         )
         self.mem.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        self._legacy_regression_pending = False
         if "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.global_step = int(checkpoint.get("global_step", 0))
+        self.joint_phase_initialized = bool(checkpoint.get(
+            "joint_phase_initialized",
+            self.args.gate_calibration_steps == 0
+            or self.global_step > self.args.gate_calibration_steps,
+        ))
         print(f"Resumed: step={self.global_step}")
+
+    def _start_joint_phase(self) -> None:
+        """Start A2 from the A1 boundary with a fresh optimizer state."""
+        if self.joint_phase_initialized or self.resolved_joint_finetune_steps <= 0:
+            return
+        source = Path(self.args.output_dir) / "gate_only.pt"
+        if not source.exists():
+            raise RuntimeError(f"A2 启动失败: {source} 不存在")
+        checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+        self.mem.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        self.optimizer = build_gate_optimizer(
+            self.mem,
+            base_lr=self.args.lr,
+            gate_lr=self.args.gate_lr,
+            weight_decay=self.args.weight_decay,
+        )
+        self.joint_phase_initialized = True
+        self.save(
+            self.args.output_dir,
+            {"phase": "joint_start", "a1_source": source.name},
+        )
+        print(f"  A2 joint fine-tune 从 {source.name} 启动 (optimizer 已重置)")
 
 
 def main():

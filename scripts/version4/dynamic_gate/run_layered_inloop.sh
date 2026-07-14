@@ -61,6 +61,11 @@ esac
 TOTAL_STEPS=$((CALIBRATION_STEPS + JOINT_STEPS))
 OUTPUT_DIR=${OUTPUT_DIR:-$PROJ/checkpoints/v4_gate_layered_${INIT_SCHEME}_s${S}_d${D}}
 
+RESUME_ARGS=()
+if [[ -f "$OUTPUT_DIR/latest.pt" ]]; then
+  RESUME_ARGS=(--resume "$OUTPUT_DIR/latest.pt")
+fi
+
 mkdir -p /mnt/petrelfs/leihaodong/s3mount_logs
 MOUNT_POINT=/mnt/petrelfs/leihaodong/tmp/s3_v4_gate_${SLURM_JOB_ID}
 CACHE_DIR=/nvme/leihaodong/s3cache_v4_gate_${SLURM_JOB_ID}
@@ -104,6 +109,7 @@ echo "calibration=$CALIBRATION_STEPS joint=$JOINT_STEPS prior=$PRIOR_WEIGHT/$PRI
   --seed "$SEED" \
   --lr "$BASE_LR" --gate_lr "$GATE_LR" --weight_decay 0.0 \
   --warmup_steps 100 --grad_clip 1.0 --num_workers 2 \
-  --log_interval 25 --val_interval 250 --save_interval 500
+  --log_interval 25 --val_interval 250 --save_interval 500 \
+  "${RESUME_ARGS[@]}"
 
 echo "dynamic gate layered 完成: $OUTPUT_DIR"

@@ -50,7 +50,10 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transmem import TransMemConfig, TransMem, DistillLoss, FrozenLMHead
-from transmem.checkpoints import load_legacy_gate_state
+from transmem.checkpoints import (
+    load_legacy_gate_state,
+    materialize_migrated_gate_checkpoint,
+)
 from transmem.diagnostics import parse_curve_steps
 from transmem.gate_training import (
     build_gate_optimizer,
@@ -562,6 +565,7 @@ class OffPolicyTrainer:
             args, self.config.to_dict(), world_size=self.world)
         self._resume_recipe = None
         self.parent_checkpoint = None
+        self._legacy_regression_pending = False
         assert self.config.causal, (
             "序列级 off-policy 训练依赖 causal mask (尾部 padding 不可见 + "
             "query 只看历史); causal=false 与 token-by-token 推理语义不兼容")
@@ -574,6 +578,23 @@ class OffPolicyTrainer:
             load_legacy_gate_state(self.mem, parent)
             self.parent_checkpoint = _normalize_path(args.init_checkpoint)
             del parent
+            migrated_path = Path(args.output_dir) / "migrated_init.pt"
+            if self.is_main:
+                materialize_migrated_gate_checkpoint(
+                    self.mem,
+                    migrated_path,
+                    parent_checkpoint=self.parent_checkpoint,
+                    gate_calibration_steps=args.gate_calibration_steps,
+                    joint_finetune_steps=args.joint_finetune_steps,
+                    seed=getattr(args, "seed", None),
+                )
+            if self.world > 1:
+                dist.barrier()
+            migrated = torch.load(
+                migrated_path, map_location="cpu", weights_only=False)
+            self.mem.load_state_dict(migrated["model_state_dict"], strict=True)
+            del migrated
+            self._legacy_regression_pending = True
         elif self.config.warm_start:
             self._warm_start()
         # DDP wrap: 梯度 allreduce 用 self.net; state_dict/clip/correct 仍走裸 self.mem.
@@ -614,6 +635,11 @@ class OffPolicyTrainer:
         self.epoch = 0
         self.best_val = float("inf")   # 最优 val_loss, 独立持久化到 result.json (resume 不重置)
         self.best_step = -1
+        self.best_gate_val = float("inf")
+        self.best_gate_step = -1
+        self.joint_phase_initialized = not (
+            args.init_scheme == "legacy_gate"
+            and args.gate_calibration_steps > 0)
         self.writer = (SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
                        if self.is_main else None)
 
@@ -676,6 +702,19 @@ class OffPolicyTrainer:
         valid = q_mask.to(X.device)                              # [B, M] bool
         hq_prime_v = hq_prime[valid]                             # [P, dim] 有效位
         student_logits = self.lm_head(hq_prime_v)                # [P, vocab]
+        if self._legacy_regression_pending:
+            with torch.no_grad():
+                if not torch.equal(proposal.gate, torch.ones_like(proposal.gate)):
+                    raise RuntimeError("legacy_gate step-0 回归失败: gate 不严格等于 1")
+                legacy_hidden = hq_stu + proposal.ms.to(hq_stu.dtype)
+                legacy_logits = self.lm_head(legacy_hidden[valid])
+                if not torch.equal(student_logits.detach(), legacy_logits):
+                    error = float((student_logits.detach() - legacy_logits).abs().max())
+                    raise RuntimeError(
+                        f"legacy_gate step-0 logits 回归失败: max_error={error:.3e}")
+            self._legacy_regression_pending = False
+            if self.is_main:
+                print("legacy_gate step-0 logits regression: PASS")
 
         if self.args.loss == "ce":
             # SFT-on-golden: 直接对 golden token 交叉熵, 不需 teacher
@@ -737,7 +776,9 @@ class OffPolicyTrainer:
             X = X.to(self.device)
             hq_tea = hq_tea.to(self.device)
             _, m = self.compute_loss(X, hq_tea, ans, q_mask, full=True)
-            agg["val_loss"] += m["loss"]
+            # Model selection uses held-out task loss; the training-only gate
+            # prior must not make g≈1 look artificially better.
+            agg["val_loss"] += m.get("task_loss", m["loss"])
             agg["val_top1"] += m["top1"]
             agg["val_improve"] += m.get("improve", 0.0)
             agg["val_gate_mean"] += m["gate_mean"]
@@ -765,7 +806,8 @@ class OffPolicyTrainer:
                 "gate_calibration_steps": self.args.gate_calibration_steps,
                 "joint_finetune_steps": getattr(
                     self, "resolved_joint_finetune_steps",
-                    self.args.joint_finetune_steps)}
+                    self.args.joint_finetune_steps),
+                "joint_phase_initialized": self.joint_phase_initialized}
         if metrics:
             base["metrics"] = metrics
         # latest.pt 带 optimizer (断点续训需要); best/final 只存 model_state_dict —
@@ -779,9 +821,12 @@ class OffPolicyTrainer:
         _asave(dict(base, optimizer_state_dict=self.optimizer.state_dict()),
                Path(path) / "latest.pt")
         names = ["latest.pt"]
-        if kind == "best":
+        if kind in {"best", "best_and_gate"}:
             _asave(base, Path(path) / "best.pt"); names.append("best.pt(model-only)")
-        elif kind == "calibrated":
+        if kind in {"gate_best", "best_and_gate"}:
+            _asave(base, Path(path) / "gate_only_best.pt")
+            names.append("gate_only_best.pt(model-only)")
+        if kind == "calibrated":
             _asave(base, Path(path) / "gate_only.pt")
             names.append("gate_only.pt(model-only)")
         elif kind == "final":
@@ -831,10 +876,16 @@ class OffPolicyTrainer:
         self._resume_recipe = saved_recipe
         self.training_recipe = current_recipe
         self.mem.load_state_dict(ckpt["model_state_dict"])
+        self._legacy_regression_pending = False
         if "optimizer_state_dict" in ckpt:          # best.pt 是 model-only, 无 optimizer
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.global_step = ckpt.get("global_step", 0)
         self.epoch = ckpt.get("epoch", 0)
+        self.joint_phase_initialized = bool(ckpt.get(
+            "joint_phase_initialized",
+            self.args.gate_calibration_steps == 0
+            or self.global_step > self.args.gate_calibration_steps,
+        ))
         self._load_result()   # 恢复 best_val, 避免 resume 后覆盖历史最优
         if self.is_main:
             if saved_recipe is None:
@@ -852,6 +903,8 @@ class OffPolicyTrainer:
                 r = json.loads(p.read_text())
                 self.best_val = r.get("best_val", float("inf"))
                 self.best_step = r.get("best_step", -1)
+                self.best_gate_val = r.get("best_gate_val", float("inf"))
+                self.best_gate_step = r.get("best_gate_step", -1)
             except (json.JSONDecodeError, OSError) as e:
                 print(f"  警告: 读取 {p} 失败 ({e}), best_val 保持 {self.best_val}")
 
@@ -860,6 +913,8 @@ class OffPolicyTrainer:
         if not self.is_main:
             return
         r = {"best_val": self.best_val, "best_step": self.best_step,
+             "best_gate_val": self.best_gate_val,
+             "best_gate_step": self.best_gate_step,
              "global_step": self.global_step, "epoch": self.epoch,
              "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
         if extra:
@@ -869,6 +924,43 @@ class OffPolicyTrainer:
         tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(r, indent=2, ensure_ascii=False))
         tmp.replace(p)   # 同目录 rename, 原子替换, 防止写一半的损坏文件
+
+    def _start_joint_phase(self) -> None:
+        """Reload A1's held-out best model and start A2 with fresh Adam state."""
+        if self.joint_phase_initialized or self.resolved_joint_finetune_steps <= 0:
+            return
+        if self.world > 1:
+            dist.barrier()
+        source_name = None
+        if self.is_main:
+            output = Path(self.args.output_dir)
+            source = output / "gate_only_best.pt"
+            if not source.exists():
+                source = output / "gate_only.pt"
+            if not source.exists():
+                raise RuntimeError(
+                    "A2 启动失败: gate_only_best.pt 和 gate_only.pt 均不存在")
+            checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+            self.mem.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            source_name = source.name
+        if self.world > 1:
+            for parameter in self.mem.parameters():
+                dist.broadcast(parameter.data, src=0)
+        self.optimizer = build_gate_optimizer(
+            self.mem,
+            base_lr=self.args.lr,
+            gate_lr=self.args.gate_lr,
+            weight_decay=self.args.weight_decay,
+        )
+        self.joint_phase_initialized = True
+        if self.is_main:
+            self.save(
+                self.args.output_dir,
+                {"phase": "joint_start", "a1_source": source_name},
+            )
+            print(f"  A2 joint fine-tune 从 {source_name} 启动 (optimizer 已重置)")
+        if self.world > 1:
+            dist.barrier()
 
     def run(self):
         args = self.args
@@ -931,6 +1023,33 @@ class OffPolicyTrainer:
         # next optimizer update; fresh runs use the evaluator's student step 0.
         self._maybe_save_curve_checkpoint(curve_steps, schedule_total_steps)
 
+        # A1 may legitimately select the unmodified migrated checkpoint when
+        # every calibration update hurts held-out loss.  Record that step-0
+        # candidate before any optimizer update.
+        if (val_dl is not None
+                and args.init_scheme == "legacy_gate"
+                and args.gate_calibration_steps > 0
+                and self.global_step == 0):
+            vm = self.validate(val_dl)
+            print(f"  --- A1 VAL step 0: val_loss={vm['val_loss']:.6f} ---")
+            self.best_gate_val = vm["val_loss"]
+            self.best_gate_step = 0
+            self.save(
+                args.output_dir,
+                {"val_loss": self.best_gate_val, "phase": "gate_only"},
+                kind="gate_best",
+            )
+            self._save_result({"best_gate_metrics": vm})
+
+        # A preempted job can leave the boundary gate_only.pt written while
+        # latest.pt still contains the A1 optimizer.  Finish the transition
+        # deterministically before taking an A2 update.
+        if (args.init_scheme == "legacy_gate"
+                and args.gate_calibration_steps > 0
+                and self.global_step >= args.gate_calibration_steps
+                and not self.joint_phase_initialized):
+            self._start_joint_phase()
+
         if args.overfit_batch:
             X, hq_tea, ans, q_mask = next(iter(train_dl))
             X, hq_tea = X.to(self.device), hq_tea.to(self.device)
@@ -968,10 +1087,6 @@ class OffPolicyTrainer:
                 m = self.train_step(X, hq_tea, ans, q_mask, full=full)
                 self.global_step += 1
                 running += m["loss"]
-                if (args.init_scheme == "legacy_gate"
-                        and args.gate_calibration_steps > 0
-                        and self.global_step == args.gate_calibration_steps):
-                    self.save(args.output_dir, {"phase": "gate_only"}, kind="calibrated")
                 self._maybe_save_curve_checkpoint(curve_steps, schedule_total_steps)
                 if self.is_main and self.global_step % args.log_interval == 0:
                     lrs = {group.get("group_name", "base"): group["lr"]
@@ -1022,13 +1137,44 @@ class OffPolicyTrainer:
                     self.writer.add_scalar("val/loss", vm["val_loss"], self.global_step)
                     self.writer.add_scalar("val/top1", vm["val_top1"], self.global_step)
                     self.writer.add_scalar("val/improve", vm["val_improve"], self.global_step)
-                    if vm["val_loss"] < self.best_val:
+                    improved_best = vm["val_loss"] < self.best_val
+                    improved_gate = (
+                        args.init_scheme == "legacy_gate"
+                        and self.global_step <= args.gate_calibration_steps
+                        and vm["val_loss"] < self.best_gate_val)
+                    if improved_best:
                         self.best_val = vm["val_loss"]
                         self.best_step = self.global_step
-                        self.save(args.output_dir, {"val_loss": self.best_val, "best": True},
-                                  kind="best")
-                        self._save_result({"best_metrics": vm})
-                if self.global_step % args.save_interval == 0:
+                    if improved_gate:
+                        self.best_gate_val = vm["val_loss"]
+                        self.best_gate_step = self.global_step
+                    if improved_best or improved_gate:
+                        kind = ("best_and_gate" if improved_best and improved_gate
+                                else "best" if improved_best else "gate_best")
+                        self.save(
+                            args.output_dir,
+                            {"val_loss": vm["val_loss"],
+                             "phase": ("gate_only" if improved_gate else "joint")},
+                            kind=kind,
+                        )
+                        payload = {}
+                        if improved_best:
+                            payload["best_metrics"] = vm
+                        if improved_gate:
+                            payload["best_gate_metrics"] = vm
+                        self._save_result(payload)
+                at_calibration_boundary = (
+                    args.init_scheme == "legacy_gate"
+                    and args.gate_calibration_steps > 0
+                    and self.global_step == args.gate_calibration_steps)
+                if at_calibration_boundary:
+                    self.save(
+                        args.output_dir,
+                        {"phase": "gate_only_boundary"},
+                        kind="calibrated",
+                    )
+                    self._start_joint_phase()
+                elif self.global_step % args.save_interval == 0:
                     self.save(args.output_dir)
         final = self.validate(val_dl, max_batches=200) if val_dl else {}
         self.save(args.output_dir, final, kind="final")

@@ -506,3 +506,120 @@ def test_layered_dynamic_gate_matches_teacher_forcing_and_backpropagates() -> No
         for layer in inject_layers:
             gradient = layered.block(layer).gate_proj.weight.grad
             assert gradient is not None and float(gradient.abs().sum()) > 0.0
+
+
+def test_layered_replacement_changes_only_qpos() -> None:
+    """Context, HM and question positions remain bitwise unchanged."""
+    from transmem.layered import replace_query_positions
+
+    hidden = torch.arange(2 * 7 * 4, dtype=torch.float32).reshape(2, 7, 4)
+    original = hidden.clone()
+    qpos = torch.tensor([2, 5], dtype=torch.long)
+    corrected = torch.full((2, 2, 4), -7.0)
+
+    result = replace_query_positions(hidden, qpos, corrected)
+
+    outside = torch.ones(7, dtype=torch.bool)
+    outside[qpos] = False
+    assert torch.equal(hidden, original)
+    assert torch.equal(result[:, outside, :], original[:, outside, :])
+    assert torch.equal(result[:, qpos, :], corrected)
+
+
+def test_in_memory_migration_is_materialized_then_strict_reloaded(tmp_path) -> None:
+    """Trainer migration writes a self-describing strict resume boundary."""
+    from transmem.checkpoints import (
+        load_legacy_gate_state,
+        materialize_migrated_gate_checkpoint,
+    )
+
+    legacy = TransMem(_tiny_config(gate_mode="constant"))
+    dynamic = TransMem(_tiny_config(gate_mode="centered_sigmoid"))
+    load_legacy_gate_state(dynamic, {
+        "config": legacy.config.to_dict(),
+        "model_state_dict": legacy.state_dict(),
+    })
+    destination = tmp_path / "migrated_init.pt"
+    parent = tmp_path / "legacy.pt"
+    materialize_migrated_gate_checkpoint(
+        dynamic,
+        destination,
+        parent_checkpoint=str(parent),
+        gate_calibration_steps=20,
+        joint_finetune_steps=80,
+        seed=29,
+    )
+    checkpoint = torch.load(destination, map_location="cpu", weights_only=False)
+    assert checkpoint["kind"] == "migrated_init"
+    assert checkpoint["parent_checkpoint"] == str(parent.resolve())
+    assert checkpoint["gate_calibration_steps"] == 20
+    assert checkpoint["joint_finetune_steps"] == 80
+    restored = TransMem(TransMemConfig(**checkpoint["config"]))
+    restored.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+    assert dynamic.gate_proj is not None
+    with torch.no_grad():
+        dynamic.gate_proj.bias.add_(1.0)
+    materialize_migrated_gate_checkpoint(
+        dynamic,
+        destination,
+        parent_checkpoint=str(parent),
+        gate_calibration_steps=20,
+        joint_finetune_steps=80,
+        seed=29,
+    )
+    assert torch.equal(dynamic.gate_proj.bias, restored.gate_proj.bias)
+
+
+def test_restored_optimizer_contains_every_gate_parameter() -> None:
+    """A latest.pt-style optimizer roundtrip must retain all gate Adam state."""
+    from transmem.gate_training import build_gate_optimizer, named_gate_parameters
+
+    torch.manual_seed(37)
+    memory = TransMem(_tiny_config(gate_mode="centered_sigmoid"))
+    optimizer = build_gate_optimizer(
+        memory, base_lr=1e-3, gate_lr=2e-3, weight_decay=0.0)
+    inputs = torch.randn(2, memory.config.n_mem + 2, memory.dim)
+    memory(inputs, return_all_queries=True).gate.sum().backward()
+    optimizer.step()
+
+    restored = TransMem(_tiny_config(gate_mode="centered_sigmoid"))
+    restored.load_state_dict(memory.state_dict(), strict=True)
+    restored_optimizer = build_gate_optimizer(
+        restored, base_lr=1e-3, gate_lr=2e-3, weight_decay=0.0)
+    restored_optimizer.load_state_dict(optimizer.state_dict())
+    gate_parameters = [parameter for _, parameter in named_gate_parameters(restored)]
+    gate_group = next(
+        group for group in restored_optimizer.param_groups
+        if group["group_name"] == "gate")
+    assert {id(parameter) for parameter in gate_group["params"]} == {
+        id(parameter) for parameter in gate_parameters}
+    assert all(parameter in restored_optimizer.state for parameter in gate_parameters)
+
+
+def test_scratch_joint_updates_out_projection_before_gate() -> None:
+    """B1 identity start first learns MS; the gate receives signal afterwards."""
+    from transmem.gate_training import build_gate_optimizer
+
+    torch.manual_seed(41)
+    memory = TransMem(_tiny_config(
+        gate_mode="centered_sigmoid", zero_init_out=True))
+    optimizer = build_gate_optimizer(
+        memory, base_lr=1e-2, gate_lr=1e-2, weight_decay=0.0)
+    inputs = torch.randn(2, memory.config.n_mem + 3, memory.dim)
+    hq = inputs[:, memory.config.n_mem :, :]
+    target = torch.randn_like(hq)
+
+    first = memory(inputs, return_all_queries=True)
+    (memory.correct(hq, first) - target).square().mean().backward()
+    assert float(memory.out_proj.weight.grad.abs().sum()) > 0.0
+    assert memory.gate_proj is not None
+    assert memory.gate_proj.weight.grad is not None
+    assert torch.count_nonzero(memory.gate_proj.weight.grad).item() == 0
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    second = memory(inputs, return_all_queries=True)
+    (memory.correct(hq, second) - target).square().mean().backward()
+    assert memory.gate_proj.weight.grad is not None
+    assert float(memory.gate_proj.weight.grad.abs().sum()) > 0.0

@@ -195,6 +195,32 @@ class LayeredOutput:
         return TransMemOutput(ms=self.ms[:, index], gate=self.gate[:, index])
 
 
+def replace_query_positions(
+    hidden: torch.Tensor,
+    qpos: torch.Tensor,
+    corrected: torch.Tensor,
+) -> torch.Tensor:
+    """Return a copy with only answer-query positions replaced.
+
+    Keeping this operation in one small seam makes it testable that context,
+    HM and question positions are never touched by layered injection.
+    """
+    if hidden.ndim != 3 or corrected.ndim != 3 or qpos.ndim != 1:
+        raise ValueError(
+            "hidden/corrected/qpos 必须分别是 [B,T,D]/[B,M,D]/[M]")
+    if (hidden.shape[0] != corrected.shape[0]
+            or hidden.shape[2] != corrected.shape[2]
+            or corrected.shape[1] != qpos.numel()):
+        raise ValueError(
+            f"qpos 替换 shape 不匹配: hidden={tuple(hidden.shape)}, "
+            f"corrected={tuple(corrected.shape)}, qpos={tuple(qpos.shape)}")
+    if qpos.dtype != torch.long:
+        raise ValueError("qpos 必须是 torch.long")
+    result = hidden.clone()
+    result.index_copy_(1, qpos, corrected)
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 模块: D 个独立 1 层 TransMem
 # ═══════════════════════════════════════════════════════════════════════
@@ -366,7 +392,8 @@ class LayeredRollout:
     # ── 在环教师强制前向 (v3.2 训练用, 梯度可通; 无 no_grad) ─────────────
     def teacher_forced_forward(self, full_ids: torch.Tensor, len_cl: int,
                                len_cq: int, M: int,
-                               return_proposals: bool = False):
+                               return_proposals: bool = False,
+                               force_gate_one: bool = False):
         """full_ids = [CQ ; A_1..M-1] (与 stage0 student_forward 同构) 的单次并行前向,
         注入位 = M 个答案生成位 qpos = len_cq-1 .. len_cq+M-2 (prefill 末位 + 之后每个
         decode 位), 与 generate_from_ids 的注入集合逐位一致; LLM 因果注意力 + 块内
@@ -397,9 +424,12 @@ class LayeredRollout:
                 proposal = block(X, return_all_queries=True)
                 if return_proposals:
                     captured[layer_idx] = proposal
+                applied = (TransMemOutput(
+                    ms=proposal.ms, gate=torch.ones_like(proposal.gate))
+                    if force_gate_one else proposal)
                 # 读 h0、写 clone: 无原地读写混叠, autograd 干净
-                h = h0.clone()
-                h[:, qpos, :] = block.correct(hq, proposal)
+                h = replace_query_positions(
+                    h0, qpos, block.correct(hq, applied))
                 if isinstance(out, tuple):
                     return (h,) + tuple(out[1:])
                 return h
