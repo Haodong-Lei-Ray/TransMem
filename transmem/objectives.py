@@ -6,7 +6,7 @@ train.png: "对齐, off-policy 和 OPD 俩种方式都做做".
 因此散度在这里实现一次, 供两种训练脚本复用 (法则第 4 条).
 
   teacher_logits = lm_head(HQ_tea_i)          (冻结, 作为稠密软目标)
-  student_logits = lm_head(HQ'_i)             (HQ'_i = HQ_stu_i + a*MS_i, 可微回传到 TransMem)
+  student_logits = lm_head(HQ'_i)             (HQ'_i = HQ_stu_i + g_i*MS_i; legacy 仍支持 a*MS)
   L = divergence(P_tea, P_stu)                (+ 可选表征回归 ||HQ'-HQ_tea||^2 热身)
 
 散度可选 (config 驱动):

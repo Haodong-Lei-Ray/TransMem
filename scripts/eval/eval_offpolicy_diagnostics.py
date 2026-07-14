@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -120,11 +121,61 @@ def _candidate_hidden(
     memory: TransMem,
     hm: torch.Tensor,
     hq_student: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, Any]:
     X = torch.cat([hm, hq_student], dim=1)
     memory_state = memory(X, return_all_queries=True)
-    corrected = memory.correct(memory_state, hq_student)
-    return corrected, corrected - hq_student
+    corrected = memory.correct(hq_student, memory_state)
+    return corrected, corrected - hq_student, memory_state
+
+
+class _PearsonAccumulator:
+    """Streaming float64 Pearson correlation over finite token pairs."""
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.sum_x = self.sum_y = 0.0
+        self.sum_xx = self.sum_yy = self.sum_xy = 0.0
+
+    def update(self, x: torch.Tensor, y: torch.Tensor) -> None:
+        if x.shape != y.shape:
+            raise ValueError(
+                f"correlation tensors must match, got {tuple(x.shape)} and {tuple(y.shape)}")
+        x = x.detach().double().reshape(-1)
+        y = y.detach().double().reshape(-1)
+        finite = torch.isfinite(x) & torch.isfinite(y)
+        x, y = x[finite], y[finite]
+        if x.numel() == 0:
+            return
+        self.n += int(x.numel())
+        self.sum_x += float(x.sum())
+        self.sum_y += float(y.sum())
+        self.sum_xx += float((x * x).sum())
+        self.sum_yy += float((y * y).sum())
+        self.sum_xy += float((x * y).sum())
+
+    def summary(self) -> dict[str, float | int | None]:
+        numerator = self.n * self.sum_xy - self.sum_x * self.sum_y
+        variance_x = self.n * self.sum_xx - self.sum_x * self.sum_x
+        variance_y = self.n * self.sum_yy - self.sum_y * self.sum_y
+        denominator = math.sqrt(max(variance_x, 0.0) * max(variance_y, 0.0))
+        pearson = (numerator / denominator
+                   if self.n >= 2 and denominator > 0.0 else None)
+        if pearson is not None:
+            # Round-off can otherwise produce values infinitesimally outside [-1, 1].
+            pearson = max(-1.0, min(1.0, pearson))
+        return {"pearson": pearson, "positions": self.n}
+
+
+def _update_gate_kl_correlations(
+    accumulators: dict[str, _PearsonAccumulator],
+    gate_valid: torch.Tensor,
+    kl_improvement: torch.Tensor,
+    valid_cpu: torch.Tensor,
+) -> None:
+    """Split valid token pairs into the same all/first/later groups as metrics."""
+    for group, group_mask in position_groups(valid_cpu).items():
+        select = group_mask[valid_cpu].to(gate_valid.device)
+        accumulators[group].update(gate_valid[select], kl_improvement[select])
 
 
 def _print_summary(summary: dict[str, dict[str, dict[str, float | int]]]) -> None:
@@ -211,6 +262,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     accumulator = MetricAccumulator()
+    gate_kl_correlations = {
+        group: _PearsonAccumulator() for group in ("all", "first", "later")
+    }
     started = time.time()
     completed = 0
     for batch_number, (indices, X_cpu, hq_tea_cpu, answer_cpu, valid_cpu) in enumerate(
@@ -231,7 +285,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         student_logits = lm_head(hq_student_valid)
         student_top1 = student_logits.argmax(dim=-1)
 
-        real_hidden, real_correction = _candidate_hidden(
+        real_hidden, real_correction, real_proposal = _candidate_hidden(
             memory, hm_real, hq_student)
         real_logits = lm_head(real_hidden[valid])
         real_top1 = real_logits.argmax(dim=-1)
@@ -244,7 +298,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             student_top1=student_top1,
         )
         _add_grouped(accumulator, "real", real_metrics, valid_cpu)
-        del real_logits, real_metrics, real_hidden, real_correction
 
         student_metrics = token_metrics(
             student_logits,
@@ -255,7 +308,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             student_top1=student_top1,
         )
         _add_grouped(accumulator, "student", student_metrics, valid_cpu)
-        del student_metrics, student_logits
+        gate_valid = real_proposal.gate.squeeze(-1)[valid]
+        kl_improvement = (
+            student_metrics["forward_kl"] - real_metrics["forward_kl"])
+        _update_gate_kl_correlations(
+            gate_kl_correlations, gate_valid, kl_improvement, valid_cpu)
+        del (student_metrics, student_logits, real_logits, real_metrics,
+             real_hidden, real_correction, real_proposal, gate_valid, kl_improvement)
 
         donor_hm_cpu = torch.stack([
             dataset[int(donors[int(index)])][0] for index in indices
@@ -265,7 +324,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "zero": torch.zeros_like(hm_real),
         }
         for mode, hm in hm_modes.items():
-            candidate_hidden, correction = _candidate_hidden(
+            candidate_hidden, correction, candidate_proposal = _candidate_hidden(
                 memory, hm, hq_student)
             candidate_logits = lm_head(candidate_hidden[valid])
             metrics = token_metrics(
@@ -277,7 +336,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 student_top1=student_top1,
             )
             _add_grouped(accumulator, mode, metrics, valid_cpu)
-            del candidate_hidden, correction, candidate_logits, metrics
+            del (candidate_hidden, correction, candidate_proposal,
+                 candidate_logits, metrics)
 
         completed += len(indices)
         if batch_number % args.log_interval == 0 or completed == count:
@@ -288,7 +348,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     metrics_summary = accumulator.summary()
     result: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "experiment": "offpolicy_hm_and_position_diagnostics",
         "checkpoint": str(checkpoint_path.resolve()),
         "checkpoint_step": checkpoint.get("global_step"),
@@ -310,6 +370,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "changed_from_student": "candidate argmax differs from raw student argmax",
         },
         "metrics": metrics_summary,
+        "gate_diagnostics": {
+            "gate_vs_student_forward_kl_improvement": {
+                group: correlation.summary()
+                for group, correlation in gate_kl_correlations.items()
+            },
+            "kl_improvement_definition": (
+                "student forward_kl minus real-HM TransMem forward_kl; positive is better"),
+        },
         "elapsed_seconds": round(time.time() - started, 3),
     }
 
@@ -321,6 +389,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     os.replace(temporary, output)
 
     _print_summary(metrics_summary)
+    correlations = result["gate_diagnostics"][
+        "gate_vs_student_forward_kl_improvement"]
+    print("gate vs student-KL improvement Pearson:")
+    for group in ("all", "first", "later"):
+        value = correlations[group]["pearson"]
+        rendered = "n/a" if value is None else f"{value:.5f}"
+        print(f"  {group:<5} r={rendered} n={correlations[group]['positions']}")
     print(f"JSON: {output}")
     return result
 

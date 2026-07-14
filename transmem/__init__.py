@@ -3,7 +3,7 @@
 LLM 全程冻结, TransMem 是唯一可训练模块. 详见 Project4/docs/plan.md.
 """
 
-from .transmem import TransMemConfig, TransMem, build_transmem
+from .transmem import TransMemConfig, TransMemOutput, TransMem, build_transmem
 from .objectives import DistillLoss, FrozenLMHead
 from .layers import (
     to_qwen3_config,
@@ -13,6 +13,7 @@ from .layers import (
 
 __all__ = [
     "TransMemConfig",
+    "TransMemOutput",
     "TransMem",
     "build_transmem",
     "DistillLoss",

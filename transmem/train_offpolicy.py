@@ -9,7 +9,7 @@ Stage 1 (off-policy) — 训练 TransMem: 逐位置蒸馏, 穿冻结 lm_head 反
 query, 与 token-by-token 推理一致.
   X             = [HM_stu ; HQ_stu_1..M]          [B, N+M_max, dim]  (批内右 padding)
   MS_1..M       = TransMem(X, return_all_queries) [B, M_max, dim]    (causal 并行前向)
-  HQ'_i         = HQ_stu_i + a*MS_i
+  HQ'_i         = HQ_stu_i + gate_i*MS_i       (legacy constant mode 保持 a*MS)
   按 q_mask 收集有效位 (padding 不进 loss):
   student_logits= lm_head(HQ'[q_mask])            (冻结 lm_head, 可微)
   teacher_logits= lm_head(HQ_tea[q_mask])         (固定软目标)
@@ -50,7 +50,19 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transmem import TransMemConfig, TransMem, DistillLoss, FrozenLMHead
+from transmem.checkpoints import load_legacy_gate_state
 from transmem.diagnostics import parse_curve_steps
+from transmem.gate_training import (
+    build_gate_optimizer,
+    clear_base_grads_for_gate_only,
+    gate_metrics,
+    gate_prior_coefficient,
+    gate_prior_loss,
+    is_gate_only_phase,
+    set_gate_optimizer_lrs,
+    validate_dynamic_resume_checkpoint,
+    validate_gate_training_options,
+)
 
 _DTYPE = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 _TRAINING_RECIPE_VERSION = 1
@@ -107,7 +119,7 @@ def build_training_recipe(
     batch_size = int(getattr(args, "batch_size", 0))
     world_size = int(world_size)
 
-    return {
+    recipe = {
         "schema_version": _TRAINING_RECIPE_VERSION,
         "seed": getattr(args, "seed", None),
         "data": {
@@ -154,6 +166,21 @@ def build_training_recipe(
             "jsd_beta": float(getattr(args, "jsd_beta", 0.5)),
         },
     }
+    if config.get("gate_mode", "constant") != "constant":
+        recipe["gate"] = {
+            "init_scheme": str(getattr(args, "init_scheme", "scratch_joint")),
+            "init_checkpoint": _normalize_path(
+                getattr(args, "init_checkpoint", None)),
+            "gate_calibration_steps": int(
+                getattr(args, "gate_calibration_steps", 0)),
+            "joint_finetune_steps": getattr(args, "joint_finetune_steps", None),
+            "gate_lr": getattr(args, "gate_lr", None),
+            "gate_prior_weight": float(
+                getattr(args, "gate_prior_weight", 0.0)),
+            "gate_prior_anneal_steps": int(
+                getattr(args, "gate_prior_anneal_steps", 0)),
+        }
+    return recipe
 
 
 def validate_resume_recipe(
@@ -275,6 +302,14 @@ def parse_args():
     p.add_argument("--config", default="transmem/config.json")
     p.add_argument("--model_path", default=None,
                    help="warm_start=true 时用于热启动的 backbone 路径")
+    p.add_argument("--init_scheme", default="scratch_joint",
+                   choices=["legacy_gate", "scratch_joint"])
+    p.add_argument("--init_checkpoint", default=None,
+                   help="legacy_gate 的 fixed-gate 父 checkpoint")
+    p.add_argument("--gate_calibration_steps", type=int, default=0,
+                   help="legacy_gate 开始阶段仅更新 gate 的优化步数")
+    p.add_argument("--joint_finetune_steps", type=int, default=None,
+                   help="联合微调步数; 指定后总步数=calibration+joint")
     # 损失 (解耦)
     p.add_argument("--divergence", default="forward_kl",
                    choices=["forward_kl", "reverse_kl", "jsd"])
@@ -290,7 +325,12 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=16,
                    help="每批**序列条数** (每条含 M 个位置, avg M~25), 不是位置数")
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--gate_lr", type=float, default=None,
+                   help="gate 参数学习率; 默认与 --lr 相同")
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--gate_prior_weight", type=float, default=0.0)
+    p.add_argument("--gate_prior_anneal_steps", type=int, default=0,
+                   help="(g-1)^2 正则线性退火到 0 的步数; 0=关闭")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--warmup_steps", type=int, default=500)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -485,6 +525,17 @@ def make_dataloader(data_dir, batch_size, num_workers, dtype, shuffle=True,
 
 class OffPolicyTrainer:
     def __init__(self, args):
+        for name, default in {
+            "init_scheme": "scratch_joint",
+            "init_checkpoint": None,
+            "gate_calibration_steps": 0,
+            "joint_finetune_steps": None,
+            "gate_lr": None,
+            "gate_prior_weight": 0.0,
+            "gate_prior_anneal_steps": 0,
+        }.items():
+            if not hasattr(args, name):
+                setattr(args, name, default)
         self.args = args
         # ── DDP: torchrun 启动时每 rank 一卡; rank0 独占 log/TB/val/save ──
         self.rank, self.world, local_rank = setup_distributed()
@@ -499,14 +550,31 @@ class OffPolicyTrainer:
         # model initialization, not merely the data order.
         seed_everything(getattr(args, "seed", None))
         self.config = TransMemConfig.from_json(args.config)
+        validate_gate_training_options(
+            init_scheme=args.init_scheme,
+            init_checkpoint=args.init_checkpoint,
+            gate_mode=self.config.gate_mode,
+            gate_calibration_steps=args.gate_calibration_steps,
+            joint_finetune_steps=args.joint_finetune_steps,
+            warm_start=self.config.warm_start,
+        )
         self.training_recipe = build_training_recipe(
             args, self.config.to_dict(), world_size=self.world)
         self._resume_recipe = None
+        self.parent_checkpoint = None
         assert self.config.causal, (
             "序列级 off-policy 训练依赖 causal mask (尾部 padding 不可见 + "
             "query 只看历史); causal=false 与 token-by-token 推理语义不兼容")
         self.mem = TransMem(self.config).to(self.device, dtype=self.train_dtype)
-        if self.config.warm_start:
+        if args.init_scheme == "legacy_gate":
+            if self.config.warm_start:
+                raise ValueError("legacy_gate 与 warm_start=true 冲突")
+            parent = torch.load(
+                args.init_checkpoint, map_location="cpu", weights_only=False)
+            load_legacy_gate_state(self.mem, parent)
+            self.parent_checkpoint = _normalize_path(args.init_checkpoint)
+            del parent
+        elif self.config.warm_start:
             self._warm_start()
         # DDP wrap: 梯度 allreduce 用 self.net; state_dict/clip/correct 仍走裸 self.mem.
         # broadcast_buffers=False: 唯一 buffer 是常量 a, 且避免 rank0 单独 no_grad
@@ -534,13 +602,14 @@ class OffPolicyTrainer:
             print(f"Config: depth={self.config.depth}, heads={self.config.num_heads}, "
                   f"kv={self.config.num_kv_heads}, dim={self.config.dim}, "
                   f"pos={self.config.pos_mode}, causal={self.config.causal}, "
-                  f"a={self.config.a_init}, warm_start={self.config.warm_start}")
+                  f"gate={self.config.gate_mode}, init={args.init_scheme}, "
+                  f"warm_start={self.config.warm_start}")
             print(f"Loss: {args.divergence}, T={args.temperature}, reg_weight={args.reg_weight}")
             print(f"lm_head: vocab={self.lm_head.proj.out_features}")
 
-        self.optimizer = torch.optim.AdamW(
-            (p for p in self.mem.parameters() if p.requires_grad),
-            lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+        self.optimizer = build_gate_optimizer(
+            self.mem, base_lr=args.lr, gate_lr=args.gate_lr,
+            weight_decay=args.weight_decay)
         self.global_step = 0
         self.epoch = 0
         self.best_val = float("inf")   # 最优 val_loss, 独立持久化到 result.json (resume 不重置)
@@ -563,12 +632,31 @@ class OffPolicyTrainer:
     def _set_lr(self, step, total_steps):
         warmup = self.args.warmup_steps
         if step < warmup:
-            lr = self.args.lr * step / max(warmup, 1)
+            factor = step / max(warmup, 1)
         else:
             progress = (step - warmup) / max(total_steps - warmup, 1)
-            lr = self.args.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-        for g in self.optimizer.param_groups:
-            g["lr"] = lr
+            factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        set_gate_optimizer_lrs(
+            self.optimizer,
+            lr_factor=factor,
+            gate_only=is_gate_only_phase(
+                self.args.init_scheme, step, self.args.gate_calibration_steps),
+        )
+
+    def _add_gate_objective(self, task_loss, metrics, proposal, valid):
+        prior = gate_prior_loss(proposal.gate, valid)
+        prior_coef = gate_prior_coefficient(
+            step=self.global_step,
+            weight=self.args.gate_prior_weight,
+            anneal_steps=self.args.gate_prior_anneal_steps,
+        )
+        loss = task_loss + prior_coef * prior
+        metrics.update(gate_metrics(proposal.ms, proposal.gate, valid))
+        metrics["task_loss"] = float(task_loss.detach())
+        metrics["gate_prior"] = float(prior.detach())
+        metrics["gate_prior_coef"] = prior_coef
+        metrics["loss"] = float(loss.detach())
+        return loss, metrics
 
     def compute_loss(self, X, hq_tea, ans, q_mask, full: bool = False):
         """X [B,N+M,dim], hq_tea [B,M,dim], ans [B,M] golden ids, q_mask [B,M] -> (loss, metrics).
@@ -582,8 +670,8 @@ class OffPolicyTrainer:
         # 训练走 DDP wrapper (梯度 allreduce); no_grad (validate/诊断) 走裸模块,
         # 避免 rank0 单独 validate 时其它 rank 等不到集合通信而死锁
         net = self.net if torch.is_grad_enabled() else self.mem
-        ms = net(X, return_all_queries=True)                     # [B, M, dim]
-        hq_prime = self.mem.correct(ms, hq_stu)                  # [B, M, dim]
+        proposal = net(X, return_all_queries=True)
+        hq_prime = self.mem.correct(hq_stu, proposal)            # [B, M, dim]
 
         valid = q_mask.to(X.device)                              # [B, M] bool
         hq_prime_v = hq_prime[valid]                             # [P, dim] 有效位
@@ -596,13 +684,12 @@ class OffPolicyTrainer:
             metrics = {"loss": float(loss.detach()), "div": float(loss.detach()),
                        "positions": int(valid.sum())}
             with torch.no_grad():
-                metrics["ms_norm"] = float(ms[valid].norm(dim=-1).mean())
                 metrics["top1"] = float((student_logits.argmax(-1) == ans_v).float().mean())
                 if full:
                     base_ce = float(F.cross_entropy(self.lm_head(hq_stu[valid]), ans_v))
                     metrics["base_div"] = base_ce                # MS=0 未纠正的 CE
                     metrics["improve"] = ((base_ce - metrics["div"]) / base_ce) if base_ce > 1e-8 else 0.0
-            return loss, metrics
+            return self._add_gate_objective(loss, metrics, proposal, valid)
 
         # ── KD (原路径): 蒸馏教师软分布 ──────────────────────────────────
         hq_tea_v = hq_tea[valid]                                 # [P, dim]
@@ -611,7 +698,6 @@ class OffPolicyTrainer:
         loss, metrics = self.loss_fn(student_logits, teacher_logits, hq_prime_v, hq_tea_v)
         metrics["positions"] = int(valid.sum())
         with torch.no_grad():
-            metrics["ms_norm"] = float(ms[valid].norm(dim=-1).mean())  # 记忆偏置强度: 0->涨->稳
             metrics["top1"] = float(                             # 纠正后学生与教师 argmax 一致率
                 (student_logits.argmax(-1) == teacher_logits.argmax(-1)).float().mean())
             if full:
@@ -619,13 +705,21 @@ class OffPolicyTrainer:
                 bd = float(self.loss_fn.divergence_only(base_logits, teacher_logits))
                 metrics["base_div"] = bd                         # 初始 gap (student(C_L) vs teacher(C_S))
                 metrics["improve"] = ((bd - metrics["div"]) / bd) if bd > 1e-8 else 0.0
-        return loss, metrics
+        return self._add_gate_objective(loss, metrics, proposal, valid)
 
     def train_step(self, X, hq_tea, ans, q_mask, full: bool = False):
         self.net.train()
         loss, metrics = self.compute_loss(X, hq_tea, ans, q_mask, full=full)
         self.optimizer.zero_grad()
         loss.backward()
+        clear_base_grads_for_gate_only(
+            self.optimizer,
+            gate_only=is_gate_only_phase(
+                self.args.init_scheme,
+                self.global_step,
+                self.args.gate_calibration_steps,
+            ),
+        )
         if self.args.grad_clip > 0:
             gn = torch.nn.utils.clip_grad_norm_(self.mem.parameters(), self.args.grad_clip)
             metrics["grad_norm"] = float(gn)                     # 裁剪前总范数: 看是否爆/削
@@ -635,7 +729,9 @@ class OffPolicyTrainer:
     @torch.no_grad()
     def validate(self, dataloader, max_batches=50):
         self.mem.eval()
-        agg = {"val_loss": 0.0, "val_top1": 0.0, "val_improve": 0.0}
+        agg = {"val_loss": 0.0, "val_top1": 0.0, "val_improve": 0.0,
+               "val_gate_mean": 0.0, "val_gate_std": 0.0,
+               "val_delta_norm": 0.0}
         n = 0
         for X, hq_tea, ans, q_mask in dataloader:
             X = X.to(self.device)
@@ -644,6 +740,9 @@ class OffPolicyTrainer:
             agg["val_loss"] += m["loss"]
             agg["val_top1"] += m["top1"]
             agg["val_improve"] += m.get("improve", 0.0)
+            agg["val_gate_mean"] += m["gate_mean"]
+            agg["val_gate_std"] += m["gate_std"]
+            agg["val_delta_norm"] += m["delta_norm"]
             n += 1
             if n >= max_batches:
                 break
@@ -658,7 +757,15 @@ class OffPolicyTrainer:
         Path(path).mkdir(parents=True, exist_ok=True)
         base = {"model_state_dict": self.mem.state_dict(),
                 "config": self.config.to_dict(), "global_step": self.global_step,
-                "epoch": self.epoch, "training_recipe": self.training_recipe}
+                "epoch": self.epoch, "training_recipe": self.training_recipe,
+                "train_mode": "offpolicy",
+                "seed": getattr(self.args, "seed", None),
+                "init_scheme": self.args.init_scheme,
+                "parent_checkpoint": self.parent_checkpoint,
+                "gate_calibration_steps": self.args.gate_calibration_steps,
+                "joint_finetune_steps": getattr(
+                    self, "resolved_joint_finetune_steps",
+                    self.args.joint_finetune_steps)}
         if metrics:
             base["metrics"] = metrics
         # latest.pt 带 optimizer (断点续训需要); best/final 只存 model_state_dict —
@@ -674,6 +781,9 @@ class OffPolicyTrainer:
         names = ["latest.pt"]
         if kind == "best":
             _asave(base, Path(path) / "best.pt"); names.append("best.pt(model-only)")
+        elif kind == "calibrated":
+            _asave(base, Path(path) / "gate_only.pt")
+            names.append("gate_only.pt(model-only)")
         elif kind == "final":
             fn = f"step_{self.global_step:07d}.pt"
             _asave(base, Path(path) / fn); names.append(f"{fn}(model-only)")
@@ -699,6 +809,15 @@ class OffPolicyTrainer:
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        validate_dynamic_resume_checkpoint(
+            ckpt,
+            config=self.config.to_dict(),
+            init_scheme=self.args.init_scheme,
+            parent_checkpoint=self.parent_checkpoint,
+            gate_calibration_steps=self.args.gate_calibration_steps,
+            joint_finetune_steps=self.args.joint_finetune_steps,
+            seed=getattr(self.args, "seed", None),
+        )
         current_recipe = build_training_recipe(
             self.args, self.config.to_dict(), world_size=self.world)
         require_recipe = bool(getattr(self.args, "curve_steps", None))
@@ -765,7 +884,20 @@ class OffPolicyTrainer:
         assert train_dl.dataset.N == self.config.n_mem, (
             f"Stage0 数据 N={train_dl.dataset.N} != config n_mem={self.config.n_mem}: "
             f"forward 里 query 槽从第 n_mem 位切, 不一致会静默错位")
-        total_steps = args.max_steps or (args.epochs * len(train_dl))
+        default_total_steps = args.max_steps or (args.epochs * len(train_dl))
+        if args.joint_finetune_steps is not None:
+            requested_total = args.gate_calibration_steps + args.joint_finetune_steps
+            if args.max_steps is not None and args.max_steps != requested_total:
+                raise ValueError(
+                    f"--max_steps={args.max_steps} 必须等于 gate_calibration_steps + "
+                    f"joint_finetune_steps={requested_total}")
+            total_steps = requested_total
+        else:
+            total_steps = default_total_steps
+        if args.gate_calibration_steps > total_steps:
+            raise ValueError(
+                f"gate_calibration_steps={args.gate_calibration_steps} > total_steps={total_steps}")
+        self.resolved_joint_finetune_steps = total_steps - args.gate_calibration_steps
         schedule_total_steps = resolve_schedule_total_steps(
             total_steps, getattr(args, "schedule_total_steps", None))
         requested_curve_steps = set(getattr(args, "curve_steps", None) or [])
@@ -803,6 +935,7 @@ class OffPolicyTrainer:
             X, hq_tea, ans, q_mask = next(iter(train_dl))
             X, hq_tea = X.to(self.device), hq_tea.to(self.device)
             for step in range(500):
+                self._set_lr(step, 500)
                 m = self.train_step(X, hq_tea, ans, q_mask, full=(step % 50 == 0))
                 if self.writer:
                     self.writer.add_scalar("train/loss", m["loss"], step)
@@ -835,21 +968,41 @@ class OffPolicyTrainer:
                 m = self.train_step(X, hq_tea, ans, q_mask, full=full)
                 self.global_step += 1
                 running += m["loss"]
+                if (args.init_scheme == "legacy_gate"
+                        and args.gate_calibration_steps > 0
+                        and self.global_step == args.gate_calibration_steps):
+                    self.save(args.output_dir, {"phase": "gate_only"}, kind="calibrated")
                 self._maybe_save_curve_checkpoint(curve_steps, schedule_total_steps)
                 if self.is_main and self.global_step % args.log_interval == 0:
-                    lr = self.optimizer.param_groups[0]["lr"]
+                    lrs = {group.get("group_name", "base"): group["lr"]
+                           for group in self.optimizer.param_groups}
+                    lr = lrs.get("base", 0.0)
+                    gate_lr = lrs.get("gate", lr)
                     sps = args.log_interval / max(time.time() - t0, 1e-3)
                     mem_gb = torch.cuda.max_memory_allocated() / 1024**3
                     print(f"  step {self.global_step:7d}/{total_steps} | "
-                          f"loss {running/args.log_interval:.6f} | lr {lr:.2e} | "
+                          f"loss {running/args.log_interval:.6f} | "
+                          f"lr {lr:.2e}/gate {gate_lr:.2e} | "
                           f"top1 {m['top1']:.3f} | improve {m.get('improve', 0.0):.3f} | "
                           f"ms {m['ms_norm']:.2f} | gnorm {m.get('grad_norm', 0.0):.2f} | "
+                          f"gate {m['gate_mean']:.3f}±{m['gate_std']:.3f} | "
+                          f"delta {m['delta_norm']:.2f} | "
                           f"{sps:.1f} it/s | mem {mem_gb:.1f}GB")
                     self.writer.add_scalar("train/loss", running / args.log_interval, self.global_step)
                     self.writer.add_scalar("train/lr", lr, self.global_step)
+                    self.writer.add_scalar("train/gate_lr", gate_lr, self.global_step)
                     self.writer.add_scalar("train/it_per_s", sps, self.global_step)
                     self.writer.add_scalar("train/mem_gb", mem_gb, self.global_step)
                     self.writer.add_scalar("train/ms_norm", m["ms_norm"], self.global_step)
+                    self.writer.add_scalar("train/delta_norm", m["delta_norm"], self.global_step)
+                    self.writer.add_scalar("train/gate_mean", m["gate_mean"], self.global_step)
+                    self.writer.add_scalar("train/gate_std", m["gate_std"], self.global_step)
+                    for key in ("gate_p10", "gate_p50", "gate_p90",
+                                "gate_frac_lt_025", "gate_frac_gt_175"):
+                        self.writer.add_scalar(f"train/{key}", m[key], self.global_step)
+                    self.writer.add_scalar("train/gate_prior", m["gate_prior"], self.global_step)
+                    self.writer.add_scalar("train/gate_prior_coef", m["gate_prior_coef"],
+                                           self.global_step)
                     self.writer.add_scalar("train/top1", m["top1"], self.global_step)
                     if "grad_norm" in m:
                         self.writer.add_scalar("train/grad_norm", m["grad_norm"], self.global_step)

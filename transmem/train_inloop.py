@@ -54,6 +54,7 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transmem import DistillLoss
+from transmem.checkpoints import load_legacy_gate_state
 from transmem.layered import (
     LayeredConfig,
     LayeredRollout,
@@ -61,7 +62,18 @@ from transmem.layered import (
     resolve_inject_layers,
 )
 from transmem.extract_features import load_records, build_chat_prompt_ids
-from transmem.train_offpolicy import setup_distributed
+from transmem.gate_training import (
+    build_gate_optimizer,
+    clear_base_grads_for_gate_only,
+    gate_metrics,
+    gate_prior_coefficient,
+    gate_prior_loss,
+    is_gate_only_phase,
+    set_gate_optimizer_lrs,
+    validate_dynamic_resume_checkpoint,
+    validate_gate_training_options,
+)
+from transmem.train_offpolicy import seed_everything, setup_distributed
 
 
 def parse_args():
@@ -86,6 +98,12 @@ def parse_args():
         help="注入窗口的独占上界; S=32,D=4 表示层 28..31（默认取 LLM 总层数）",
     )
     p.add_argument("--inject_layers", default=None, help="显式层号, 逗号分隔 (0-based)")
+    p.add_argument("--init_scheme", default="scratch_joint",
+                   choices=["legacy_gate", "scratch_joint"])
+    p.add_argument("--init_checkpoint", default=None,
+                   help="legacy_gate 的 fixed-gate layered 父 checkpoint")
+    p.add_argument("--gate_calibration_steps", type=int, default=0)
+    p.add_argument("--joint_finetune_steps", type=int, default=None)
     # 目标
     p.add_argument("--policy", default="tf", choices=["tf", "onpolicy"])
     p.add_argument("--divergence", default="forward_kl",
@@ -100,7 +118,10 @@ def parse_args():
     p.add_argument("--output_dir", default="checkpoints/inloop")
     p.add_argument("--grad_accum", type=int, default=4, help="每 rank 微步数/优化步")
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--gate_lr", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--gate_prior_weight", type=float, default=0.0)
+    p.add_argument("--gate_prior_anneal_steps", type=int, default=0)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--warmup_steps", type=int, default=100)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -111,6 +132,8 @@ def parse_args():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--resume", default=None)
+    p.add_argument("--seed", type=int, default=None,
+                   help="显式固定 TransMem 初始化与数据顺序; 默认保持历史随机行为")
     return p.parse_args()
 
 
@@ -188,6 +211,7 @@ class InLoopTrainer:
             torch.cuda.set_device(local_rank)
             args.device = f"cuda:{local_rank}"
         self.device = torch.device(args.device)
+        seed_everything(getattr(args, "seed", None))
 
         # 冻结 LLM (测试可注入现成 model/tokenizer)
         if model is None:
@@ -211,7 +235,25 @@ class InLoopTrainer:
         cfg.inject_layers = inject
         cfg.__post_init__()
         self.config = cfg
+        init_scheme = getattr(args, "init_scheme", "scratch_joint")
+        init_checkpoint = getattr(args, "init_checkpoint", None)
+        gate_calibration_steps = getattr(args, "gate_calibration_steps", 0)
+        joint_finetune_steps = getattr(args, "joint_finetune_steps", None)
+        validate_gate_training_options(
+            init_scheme=init_scheme,
+            init_checkpoint=init_checkpoint,
+            gate_mode=cfg.gate_mode,
+            gate_calibration_steps=gate_calibration_steps,
+            joint_finetune_steps=joint_finetune_steps,
+        )
         self.mem = TransMemLayered(cfg).to(self.device, dtype=torch.float32).train()
+        self.parent_checkpoint = None
+        if init_scheme == "legacy_gate":
+            checkpoint = torch.load(
+                init_checkpoint, map_location="cpu", weights_only=False)
+            load_legacy_gate_state(self.mem, checkpoint)
+            self.parent_checkpoint = str(Path(init_checkpoint).expanduser().resolve())
+            del checkpoint
         if self.world > 1:
             for p in self.mem.parameters():
                 dist.broadcast(p.data, src=0)
@@ -220,9 +262,12 @@ class InLoopTrainer:
         self.loss_fn = DistillLoss(divergence=args.divergence,
                                    temperature=args.temperature,
                                    reg_weight=0.0, jsd_beta=args.jsd_beta)
-        self.optimizer = torch.optim.AdamW(
-            (p for p in self.mem.parameters() if p.requires_grad),
-            lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+        self.optimizer = build_gate_optimizer(
+            self.mem,
+            base_lr=args.lr,
+            gate_lr=getattr(args, "gate_lr", None),
+            weight_decay=args.weight_decay,
+        )
         self.global_step = 0            # 优化步 (非微步)
         self.epoch = 0
         self.best_val = float("inf")
@@ -232,7 +277,7 @@ class InLoopTrainer:
         if self.is_main:
             print(f"InLoop[{args.policy}]: {self.mem.num_params():,} params, "
                   f"inject={cfg.inject_layers} (D={len(cfg.inject_layers)}), "
-                  f"LLM {n_layers} 层冻结"
+                  f"LLM {n_layers} 层冻结, gate={cfg.gate_mode}, init={init_scheme}"
                   + (f" | 手动DDP x{self.world}" if self.world > 1 else ""))
 
     # ── 单样本损失 (tf / onpolicy 共用梯度前向) ─────────────────────────
@@ -276,12 +321,28 @@ class InLoopTrainer:
         full_ids = (torch.cat([cq_ids, torch.tensor([ans[:-1]], device=self.device,
                                                     dtype=cq_ids.dtype)], dim=1)
                     if M > 1 else cq_ids)
-        h_q = self.rollout.teacher_forced_forward(full_ids, len_cl, len_cq, M)
+        h_q, proposals = self.rollout.teacher_forced_forward(
+            full_ids, len_cl, len_cq, M, return_proposals=True)
         s_logits = self.model.lm_head(h_q)                           # [M, vocab]
-        loss, _ = self.loss_fn(s_logits.float(), t_logits.float())
+        task_loss, _ = self.loss_fn(s_logits.float(), t_logits.float())
+        prior = gate_prior_loss(proposals.gate)
+        prior_coef = gate_prior_coefficient(
+            step=self.global_step,
+            weight=getattr(self.args, "gate_prior_weight", 0.0),
+            anneal_steps=getattr(self.args, "gate_prior_anneal_steps", 0),
+        )
+        loss = task_loss + prior_coef * prior
         with torch.no_grad():
             top1 = float((s_logits.argmax(-1) == t_logits.argmax(-1)).float().mean())
-        return loss, M, {"top1": top1, "tokens": full_ids.shape[1]}
+            metrics = gate_metrics(proposals.ms, proposals.gate)
+        metrics.update({
+            "top1": top1,
+            "tokens": full_ids.shape[1],
+            "task_loss": float(task_loss.detach()),
+            "gate_prior": float(prior.detach()),
+            "gate_prior_coef": prior_coef,
+        })
+        return loss, M, metrics
 
     # ── 手动 DDP: allreduce 梯度后统一步进 ──────────────────────────────
     def sync_and_step(self):
@@ -290,6 +351,14 @@ class InLoopTrainer:
                 if p.grad is None:
                     p.grad = torch.zeros_like(p)     # 保证各 rank allreduce 同一集合
                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+        clear_base_grads_for_gate_only(
+            self.optimizer,
+            gate_only=is_gate_only_phase(
+                getattr(self.args, "init_scheme", "scratch_joint"),
+                self.global_step,
+                getattr(self.args, "gate_calibration_steps", 0),
+            ),
+        )
         gn = torch.nn.utils.clip_grad_norm_(self.mem.parameters(), self.args.grad_clip)
         stepped = bool(torch.isfinite(gn))
         if stepped:                                  # allreduce 后判定 → 各 rank 同步
@@ -303,6 +372,7 @@ class InLoopTrainer:
         self.mem.eval()
         n = min(self.args.val_max, len(val_ds))
         kl_sum, pos, top1_sum = 0.0, 0, 0.0
+        gate_sum = gate_std_sum = delta_sum = 0.0
         for i in range(self.rank, n, self.world):
             r = self.micro_loss(val_ds[i], policy="tf")
             if r is None:
@@ -311,13 +381,24 @@ class InLoopTrainer:
             kl_sum += float(loss) * M
             pos += M
             top1_sum += m["top1"] * M
-        t = torch.tensor([kl_sum, float(pos), top1_sum], device=self.device)
+            gate_sum += m["gate_mean"] * M
+            gate_std_sum += m["gate_std"] * M
+            delta_sum += m["delta_norm"] * M
+        t = torch.tensor(
+            [kl_sum, float(pos), top1_sum, gate_sum, gate_std_sum, delta_sum],
+            device=self.device)
         if self.world > 1:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         self.mem.train()
         denom = max(float(t[1]), 1.0)
-        return {"val_loss": float(t[0]) / denom, "val_top1": float(t[2]) / denom,
-                "val_positions": int(t[1])}
+        return {
+            "val_loss": float(t[0]) / denom,
+            "val_top1": float(t[2]) / denom,
+            "val_gate_mean": float(t[3]) / denom,
+            "val_gate_std": float(t[4]) / denom,
+            "val_delta_norm": float(t[5]) / denom,
+            "val_positions": int(t[1]),
+        }
 
     # ── 保存/恢复 (格式与 train_layered 一致 → evaluate.py 直接分发) ────
     @staticmethod
@@ -333,7 +414,15 @@ class InLoopTrainer:
         base = {"model_state_dict": self.mem.state_dict(),
                 "config": self.config.to_dict(),
                 "train_mode": f"inloop_{self.args.policy}",
-                "global_step": self.global_step, "epoch": self.epoch}
+                "global_step": self.global_step, "epoch": self.epoch,
+                "seed": getattr(self.args, "seed", None),
+                "init_scheme": getattr(self.args, "init_scheme", "scratch_joint"),
+                "parent_checkpoint": self.parent_checkpoint,
+                "gate_calibration_steps": getattr(
+                    self.args, "gate_calibration_steps", 0),
+                "joint_finetune_steps": getattr(
+                    self, "resolved_joint_finetune_steps",
+                    getattr(self.args, "joint_finetune_steps", None))}
         if metrics:
             base["metrics"] = metrics
         self._atomic_torch_save(
@@ -343,6 +432,9 @@ class InLoopTrainer:
         if kind == "best":
             self._atomic_torch_save(base, Path(path) / "best.pt")
             names.append("best.pt(model-only)")
+        elif kind == "calibrated":
+            self._atomic_torch_save(base, Path(path) / "gate_only.pt")
+            names.append("gate_only.pt(model-only)")
         elif kind == "final":
             fn = f"step_{self.global_step:07d}.pt"
             self._atomic_torch_save(base, Path(path) / fn)
@@ -351,7 +443,18 @@ class InLoopTrainer:
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.mem.load_state_dict(ckpt["model_state_dict"])
+        validate_dynamic_resume_checkpoint(
+            ckpt,
+            config=self.config.to_dict(),
+            init_scheme=getattr(self.args, "init_scheme", "scratch_joint"),
+            parent_checkpoint=self.parent_checkpoint,
+            gate_calibration_steps=getattr(
+                self.args, "gate_calibration_steps", 0),
+            joint_finetune_steps=getattr(
+                self.args, "joint_finetune_steps", None),
+            seed=getattr(self.args, "seed", None),
+        )
+        self.mem.load_state_dict(ckpt["model_state_dict"], strict=True)
         if "optimizer_state_dict" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.global_step = ckpt.get("global_step", 0)
@@ -392,12 +495,19 @@ class InLoopTrainer:
     def _set_lr(self, step, total_steps):
         warmup = self.args.warmup_steps
         if step < warmup:
-            lr = self.args.lr * step / max(warmup, 1)
+            factor = step / max(warmup, 1)
         else:
             progress = (step - warmup) / max(total_steps - warmup, 1)
-            lr = self.args.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-        for g in self.optimizer.param_groups:
-            g["lr"] = lr
+            factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        set_gate_optimizer_lrs(
+            self.optimizer,
+            lr_factor=factor,
+            gate_only=is_gate_only_phase(
+                getattr(self.args, "init_scheme", "scratch_joint"),
+                step,
+                getattr(self.args, "gate_calibration_steps", 0),
+            ),
+        )
 
     # ── 主循环 ──────────────────────────────────────────────────────────
     def run(self):
@@ -418,7 +528,21 @@ class InLoopTrainer:
                         pin_memory=False, drop_last=True,
                         persistent_workers=(args.num_workers > 0))
         steps_per_epoch = len(dl) // args.grad_accum
-        total_steps = args.max_steps or (args.epochs * steps_per_epoch)
+        default_total_steps = args.max_steps or (args.epochs * steps_per_epoch)
+        calibration_steps = getattr(args, "gate_calibration_steps", 0)
+        joint_steps = getattr(args, "joint_finetune_steps", None)
+        if joint_steps is not None:
+            requested_total = calibration_steps + joint_steps
+            if args.max_steps is not None and args.max_steps != requested_total:
+                raise ValueError(
+                    f"--max_steps={args.max_steps} 必须等于 gate_calibration_steps + "
+                    f"joint_finetune_steps={requested_total}")
+            total_steps = requested_total
+        else:
+            total_steps = default_total_steps
+        if calibration_steps > total_steps:
+            raise ValueError("gate_calibration_steps 不能超过 total_steps")
+        self.resolved_joint_finetune_steps = total_steps - calibration_steps
         if self.is_main:
             print(f"\n在环训练[{args.policy}]: {len(train_ds)} 样本, 微步/epoch={len(dl)}, "
                   f"优化步/epoch≈{steps_per_epoch}, total≈{total_steps}, "
@@ -436,6 +560,13 @@ class InLoopTrainer:
 
         micro_in_step = 0
         run_loss, run_top1, run_tok, n_micro = 0.0, 0.0, 0, 0
+        last_metrics = {
+            "gate_mean": 1.0, "gate_std": 0.0,
+            "gate_p10": 1.0, "gate_p50": 1.0, "gate_p90": 1.0,
+            "gate_frac_lt_025": 0.0, "gate_frac_gt_175": 0.0,
+            "ms_norm": 0.0, "delta_norm": 0.0,
+            "gate_prior": 0.0, "gate_prior_coef": 0.0,
+        }
         t0 = time.time()
         while self.global_step < total_steps:
             self.epoch += 1
@@ -444,14 +575,24 @@ class InLoopTrainer:
             for item in dl:
                 if self.global_step >= total_steps:
                     break
-                r = self.micro_loss(item, policy=args.policy)
-                if r is not None:
-                    loss, M, m = r
-                    (loss / args.grad_accum).backward()
-                    run_loss += float(loss.detach())
-                    run_top1 += m["top1"]
-                    run_tok += m["tokens"]
-                    n_micro += 1
+                try:
+                    r = self.micro_loss(item, policy=args.policy)
+                    if r is not None:
+                        loss, M, m = r
+                        (loss / args.grad_accum).backward()
+                        run_loss += float(loss.detach())
+                        run_top1 += m["top1"]
+                        run_tok += m["tokens"]
+                        n_micro += 1
+                        last_metrics = m
+                except torch.OutOfMemoryError:
+                    # 超长样本 (LME ~122k+梯度) OOM: 本 rank 本累积组梯度作废后跳过 —
+                    # 微步计数照常推进, 各 rank allreduce 次数不变 (同步安全);
+                    # 代价是该步梯度少一个 rank 的贡献 (可接受的偏差)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    print(f"  ⚠️ rank{self.rank} OOM 跳样本 "
+                          f"(~{item['answer_ids'].shape[0]} ans tok), 本组梯度作废")
                 micro_in_step += 1
                 if micro_in_step < args.grad_accum:
                     continue
@@ -459,23 +600,40 @@ class InLoopTrainer:
                 self._set_lr(self.global_step, total_steps)
                 gn, stepped = self.sync_and_step()
                 self.global_step += 1
+                if (getattr(args, "init_scheme", "scratch_joint") == "legacy_gate"
+                        and calibration_steps > 0
+                        and self.global_step == calibration_steps):
+                    self.save(args.output_dir, {"phase": "gate_only"}, kind="calibrated")
                 if not stepped and self.is_main:
                     print(f"  ⚠️ step {self.global_step}: grad_norm={gn} 非有限, 跳过该步")
 
                 if self.is_main and self.global_step % args.log_interval == 0:
-                    lr = self.optimizer.param_groups[0]["lr"]
+                    lrs = {group.get("group_name", "base"): group["lr"]
+                           for group in self.optimizer.param_groups}
+                    lr = lrs.get("base", 0.0)
+                    gate_lr = lrs.get("gate", lr)
                     dt = max(time.time() - t0, 1e-3)
                     sps = n_micro / dt
                     avg = run_loss / max(n_micro, 1)
                     print(f"  step {self.global_step:6d}/{total_steps} | "
                           f"kl {avg:.4f} | top1 {run_top1/max(n_micro,1):.3f} | "
-                          f"grad {gn:.3f} | lr {lr:.2e} | "
+                          f"grad {gn:.3f} | lr {lr:.2e}/gate {gate_lr:.2e} | "
+                          f"gate {last_metrics['gate_mean']:.3f}±"
+                          f"{last_metrics['gate_std']:.3f} | "
+                          f"delta {last_metrics['delta_norm']:.2f} | "
                           f"{sps:.2f} samp/s/rank | {run_tok/max(n_micro,1):.0f} tok/samp")
                     self.writer.add_scalar("train/kl", avg, self.global_step)
                     self.writer.add_scalar("train/top1", run_top1 / max(n_micro, 1),
                                            self.global_step)
                     self.writer.add_scalar("train/grad_norm", gn, self.global_step)
                     self.writer.add_scalar("train/lr", lr, self.global_step)
+                    self.writer.add_scalar("train/gate_lr", gate_lr, self.global_step)
+                    for key in ("gate_mean", "gate_std", "gate_p10", "gate_p50",
+                                "gate_p90", "gate_frac_lt_025", "gate_frac_gt_175",
+                                "ms_norm", "delta_norm", "gate_prior",
+                                "gate_prior_coef"):
+                        self.writer.add_scalar(
+                            f"train/{key}", last_metrics[key], self.global_step)
                     run_loss, run_top1, run_tok, n_micro = 0.0, 0.0, 0, 0
                     t0 = time.time()
                 if val_ds and self.global_step % args.val_interval == 0:

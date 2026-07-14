@@ -749,9 +749,9 @@ class PairedTransMemGreedy:
         memory_input = self.torch.cat([hm, hq], dim=0).unsqueeze(0).to(self.dtype)
         answer: list[int] = []
         for _ in range(max_new_tokens):
-            correction = self.mem(
+            proposal = self.mem(
                 memory_input, past_key_values=mem_cache, use_cache=True)
-            corrected = hq.to(correction.dtype) + self.mem.a * correction
+            corrected = self.mem.correct(hq, proposal)
             token_id = int(self.model.lm_head(corrected).argmax(dim=-1).item())
             answer.append(token_id)
             if token_id in self.eos_ids:

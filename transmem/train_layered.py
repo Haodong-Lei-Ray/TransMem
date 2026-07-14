@@ -11,7 +11,7 @@
 逐层损失 (块间无梯度耦合, 联合训练=独立训练, 一个 optimizer 顺手):
   最顶层 (LLM 末层): 冻结 final_norm + lm_head 的 forward-KL (对齐原 TransMem 配方;
       D=1 时整个损失退化为它 → 与原 final-hidden 设计的锚点, 差异仅 pre/post-norm).
-  其余层: 相对残差回归 rel_l = ||h_in + a*MS − HQ_tea||² / ||h_in − HQ_tea||²
+  其余层: 相对残差回归 rel_l = ||h_in + g*MS − HQ_tea||² / ||h_in − HQ_tea||²
       (分母 detach; 初始 MS=0 → rel=1, 跨层可比, 自归一避免层间数值尺度差).
   α 插值增强 (训练时, 除最低插入层外): h_in = α·HQ_tea + (1−α)·HQ_stu, α~U[0,1]
       逐样本逐层独立采样 — 教上层"下层已把 hidden 推到 stu→tea 途中任意点时,
@@ -43,6 +43,7 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transmem import DistillLoss, FrozenLMHead
+from transmem.gate_training import gate_metrics
 from transmem.layers import Qwen3RMSNorm
 from transmem.layered import LayeredConfig, TransMemLayered
 from transmem.train_offpolicy import setup_distributed
@@ -313,15 +314,16 @@ class LayeredTrainer:
             h_in = hq_stu + alpha * (hq_tea - hq_stu)
         else:
             h_in = hq_stu
-        ms_all = net(hm, h_in)                                  # [B, D, M, dim]
+        proposals = net(hm, h_in)
 
         total = None
         metrics = {"positions": int(valid.sum())}
+        metrics.update(gate_metrics(proposals.ms, proposals.gate, valid))
         rels = []
         for k, l in enumerate(layers):
             tea = hq_tea[:, k]                                  # [B, M, dim]
-            a = self.mem.block(l).a
-            hq_prime = h_in[:, k] + a * ms_all[:, k]
+            proposal = proposals.layer(k)
+            hq_prime = self.mem.block(l).correct(h_in[:, k], proposal)
 
             if l == top:
                 s_logits = self.lm_head(self.final_norm(hq_prime[valid]))
@@ -333,7 +335,7 @@ class LayeredTrainer:
                 with torch.no_grad():
                     metrics["top1"] = float(
                         (s_logits.argmax(-1) == t_logits.argmax(-1)).float().mean())
-                    metrics["ms_norm"] = float(ms_all[:, k][valid].norm(dim=-1).mean())
+                    metrics["ms_norm"] = float(proposal.ms[valid].norm(dim=-1).mean())
                 if full:
                     with torch.no_grad():
                         base_logits = self.lm_head(self.final_norm(h_in[:, k][valid]))

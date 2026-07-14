@@ -1,7 +1,7 @@
 """TransMem-Layer: 冻结 LLM 的指定 D 个 decoder 层各插一个 1 层 TransMem.
 
 与原 TransMem (final-hidden 单点偏置) 的区别: 偏置注入发生在 LLM 层栈**内部** —
-第 l 层输出的查询位 hidden 被 `h + a*MS^l` 纠正后才进入第 l+1 层, 使记忆纠正参与
+第 l 层输出的查询位 hidden 被 `h + g*MS^l` 纠正后才进入第 l+1 层, 使记忆纠正参与
 后续层的计算 (深注入). 每层一个独立的 1 层 Qwen3-block TransMem, 读该层的
 [HM^l ; HQ^l_1..i] 因果序列, 回归该层的记忆偏置 MS^l. LLM 全程冻结.
 
@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from .transmem import TransMemConfig, TransMem
+from .transmem import TransMemConfig, TransMemOutput, TransMem
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -123,6 +123,12 @@ class LayeredConfig:
     a_init: float = 1.0
     learnable_a: bool = False
 
+    gate_mode: str = "constant"
+    gate_granularity: str = "token_scalar"
+    gate_max: float = 2.0
+    gate_temperature: float = 1.0
+    gate_init: float = 1.0
+
     inject_layers: list[int] = field(default_factory=lambda: [35])
     layered: bool = True          # ckpt 识别标记 (evaluate.py 分发用)
 
@@ -145,7 +151,17 @@ class LayeredConfig:
         return cls(**kwargs)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        if self.gate_mode == "constant":
+            for name in (
+                "gate_mode",
+                "gate_granularity",
+                "gate_max",
+                "gate_temperature",
+                "gate_init",
+            ):
+                data.pop(name)
+        return data
 
     def block_config(self) -> TransMemConfig:
         return TransMemConfig(
@@ -158,7 +174,25 @@ class LayeredConfig:
             causal=self.causal, pos_mode=self.pos_mode, n_mem=self.n_mem,
             hm_mode=self.hm_mode, max_queries=self.max_queries,
             final_norm=self.final_norm, zero_init_out=self.zero_init_out,
-            a_init=self.a_init, learnable_a=self.learnable_a, warm_start=False)
+            a_init=self.a_init, learnable_a=self.learnable_a, warm_start=False,
+            gate_mode=self.gate_mode, gate_granularity=self.gate_granularity,
+            gate_max=self.gate_max, gate_temperature=self.gate_temperature,
+            gate_init=self.gate_init)
+
+
+@dataclass
+class LayeredOutput:
+    """Aligned memory proposals from all configured injection layers."""
+
+    ms: torch.Tensor
+    gate: torch.Tensor
+
+    @property
+    def delta(self) -> torch.Tensor:
+        return self.gate * self.ms
+
+    def layer(self, index: int) -> TransMemOutput:
+        return TransMemOutput(ms=self.ms[:, index], gate=self.gate[:, index])
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -179,18 +213,21 @@ class TransMemLayered(nn.Module):
     def block(self, layer_idx: int) -> TransMem:
         return self.blocks[str(layer_idx)]
 
-    def forward(self, hm: torch.Tensor, h_in: torch.Tensor) -> torch.Tensor:
+    def forward(self, hm: torch.Tensor, h_in: torch.Tensor) -> LayeredOutput:
         """训练用并行前向: 全部块跑一遍 (DDP 梯度同步要求单一 forward 覆盖全部参数).
 
         hm   [B, D, N, dim]  各注入层的记忆槽
         h_in [B, D, M, dim]  各注入层的查询输入 (训练侧可为 α 插值)
         ->   ms  [B, D, M, dim]  各层记忆偏置 (causal 并行, 与 TransMem 训练语义一致)
         """
-        out = []
+        proposals = []
         for k, l in enumerate(self.config.inject_layers):
             X = torch.cat([hm[:, k], h_in[:, k]], dim=1)        # [B, N+M, dim]
-            out.append(self.blocks[str(l)](X, return_all_queries=True))
-        return torch.stack(out, dim=1)
+            proposals.append(self.blocks[str(l)](X, return_all_queries=True))
+        return LayeredOutput(
+            ms=torch.stack([proposal.ms for proposal in proposals], dim=1),
+            gate=torch.stack([proposal.gate for proposal in proposals], dim=1),
+        )
 
     @property
     def inject_layers(self) -> list[int]:
@@ -218,9 +255,9 @@ class LayeredRollout:
 
     每个注入层挂 forward hook:
       prefill: 该层输出取 HM^l (len_cl 内 N 个槽位) + 末位查询 HQ^l_1,
-               TransMem prefill [HM;HQ_1] → MS^l_1, 末位 hidden += a*MS;
+               TransMem prefill [HM;HQ_1] → (MS^l_1,g^l_1), 末位 hidden += g*MS;
       decode : 每步新 token 位即当前查询 HQ^l_i, 增量喂 TransMem (KV cache),
-               该位 hidden += a*MS^l_i.
+               该位 hidden += g^l_i*MS^l_i.
     纠正后的 hidden 继续流入上层 → 上层的 HQ/KV 都基于纠正后的流 (深注入语义).
     LLM 侧 KV cache: 查询位的 K/V 由纠正后 hidden 计算 (与训练语义一致);
     上下文位不受影响 (bias 只加在查询位).
@@ -237,6 +274,7 @@ class LayeredRollout:
         self.n_mem = layered.config.n_mem
         self.hm_mode = layered.config.hm_mode
         self.eos_ids = resolve_eos_ids(model)
+        self.last_gate_trace = None
         n_layers = len(model.model.layers)
         assert layered.top_layer < n_layers, (
             f"inject_layers 最大 {layered.top_layer} 超出 LLM 层数 {n_layers}")
@@ -244,7 +282,8 @@ class LayeredRollout:
     # ── 可测试核心: 纯 token-id 入口 (CPU 测试不依赖 tokenizer) ─────────
     @torch.no_grad()
     def generate_from_ids(self, cq_ids: torch.Tensor, len_cl: int, max_new: int,
-                          sample: bool = False, temperature: float = 1.0) -> list[int]:
+                          sample: bool = False, temperature: float = 1.0,
+                          collect_gate_diagnostics: bool = False) -> list[int]:
         from transformers.cache_utils import DynamicCache
         from .extract_features import hm_positions
 
@@ -254,6 +293,10 @@ class LayeredRollout:
 
         state: dict[int, DynamicCache] = {}
         phase = {"mode": "prefill"}
+        trace = {
+            str(layer): {"gate": [], "ms_norm": [], "delta_norm": []}
+            for layer in self.layered.inject_layers
+        } if collect_gate_diagnostics else None
 
         def mk_hook(layer_idx: int):
             block = self.layered.block(layer_idx)
@@ -262,16 +305,23 @@ class LayeredRollout:
                 h = out[0] if isinstance(out, tuple) else out       # [1, S, dim]
                 if phase["mode"] == "prefill":
                     hm = h[0, hm_idx_t, :]                          # [N, dim]
-                    hq = h[:, -1:, :]                               # [1, 1, dim]
+                    hq = h[:, -1, :]                                # [1, dim]
                     cache = state[layer_idx] = DynamicCache()
-                    X = torch.cat([hm.unsqueeze(0), hq], dim=1).to(mem_dtype)
-                    ms = block(X, past_key_values=cache, use_cache=True)   # [1, dim]
+                    X = torch.cat([hm.unsqueeze(0), hq.unsqueeze(1)], dim=1).to(mem_dtype)
+                    proposal = block(X, past_key_values=cache, use_cache=True)
                 else:
-                    hq = h[:, -1:, :]
-                    ms = block(hq.to(mem_dtype),
-                               past_key_values=state[layer_idx], use_cache=True)
+                    hq = h[:, -1, :]
+                    proposal = block(hq.unsqueeze(1).to(mem_dtype),
+                                     past_key_values=state[layer_idx], use_cache=True)
+                if trace is not None:
+                    layer_trace = trace[str(layer_idx)]
+                    layer_trace["gate"].append(float(proposal.gate.squeeze().float()))
+                    layer_trace["ms_norm"].append(
+                        float(proposal.ms.float().norm(dim=-1).mean()))
+                    layer_trace["delta_norm"].append(
+                        float(proposal.delta.float().norm(dim=-1).mean()))
                 h = h.clone()
-                h[:, -1, :] = h[:, -1, :] + block.a.to(h.dtype) * ms.to(h.dtype)
+                h[:, -1, :] = block.correct(hq, proposal)
                 if isinstance(out, tuple):
                     return (h,) + tuple(out[1:])
                 return h
@@ -292,7 +342,7 @@ class LayeredRollout:
             past = out.past_key_values
             logits = self.model.lm_head(out.last_hidden_state[:, -1, :])   # [1, vocab]
             phase["mode"] = "decode"
-            for _ in range(max_new):
+            for token_index in range(max_new):
                 if sample:
                     probs = torch.softmax(logits.float() / max(temperature, 1e-6), dim=-1)
                     nxt = torch.multinomial(probs, 1)[0]
@@ -300,7 +350,7 @@ class LayeredRollout:
                     nxt = logits.argmax(dim=-1)
                 tok_id = int(nxt.item())
                 ans_ids.append(tok_id)
-                if tok_id in self.eos_ids:
+                if tok_id in self.eos_ids or token_index + 1 >= max_new:
                     break
                 step = self.model.model(input_ids=nxt.view(1, 1),
                                         past_key_values=past, use_cache=True)
@@ -309,11 +359,14 @@ class LayeredRollout:
         finally:
             for hd in handles:
                 hd.remove()
+        self.last_gate_trace = ({"token_ids": list(ans_ids), "layers": trace}
+                                if trace is not None else None)
         return ans_ids
 
     # ── 在环教师强制前向 (v3.2 训练用, 梯度可通; 无 no_grad) ─────────────
     def teacher_forced_forward(self, full_ids: torch.Tensor, len_cl: int,
-                               len_cq: int, M: int) -> torch.Tensor:
+                               len_cq: int, M: int,
+                               return_proposals: bool = False):
         """full_ids = [CQ ; A_1..M-1] (与 stage0 student_forward 同构) 的单次并行前向,
         注入位 = M 个答案生成位 qpos = len_cq-1 .. len_cq+M-2 (prefill 末位 + 之后每个
         decode 位), 与 generate_from_ids 的注入集合逐位一致; LLM 因果注意力 + 块内
@@ -331,6 +384,7 @@ class LayeredRollout:
                               device=dev, dtype=torch.long)
         qpos = torch.arange(len_cq - 1, len_cq + M - 1, device=dev, dtype=torch.long)
         mem_dtype = next(self.layered.parameters()).dtype
+        captured: dict[int, TransMemOutput] = {}
 
         def mk_hook(layer_idx: int):
             block = self.layered.block(layer_idx)
@@ -340,10 +394,12 @@ class LayeredRollout:
                 hm = h0[:, hm_idx, :]                               # [1, N, dim]
                 hq = h0[:, qpos, :]                                 # [1, M, dim]
                 X = torch.cat([hm, hq], dim=1).to(mem_dtype)
-                ms = block(X, return_all_queries=True)              # [1, M, dim]
+                proposal = block(X, return_all_queries=True)
+                if return_proposals:
+                    captured[layer_idx] = proposal
                 # 读 h0、写 clone: 无原地读写混叠, autograd 干净
                 h = h0.clone()
-                h[:, qpos, :] = hq + block.a.to(h0.dtype) * ms.to(h0.dtype)
+                h[:, qpos, :] = block.correct(hq, proposal)
                 if isinstance(out, tuple):
                     return (h,) + tuple(out[1:])
                 return h
@@ -359,16 +415,28 @@ class LayeredRollout:
         finally:
             for hd in handles:
                 hd.remove()
-        return out.last_hidden_state[0, qpos, :]                    # [M, dim] post-norm
+        h_q = out.last_hidden_state[0, qpos, :]                     # [M, dim] post-norm
+        if not return_proposals:
+            return h_q
+        missing = set(self.layered.inject_layers) - set(captured)
+        if missing:
+            raise RuntimeError(f"teacher-forced hooks 未捕获层: {sorted(missing)}")
+        ordered = [captured[layer] for layer in self.layered.inject_layers]
+        return h_q, LayeredOutput(
+            ms=torch.stack([proposal.ms for proposal in ordered], dim=1),
+            gate=torch.stack([proposal.gate for proposal in ordered], dim=1),
+        )
 
     # ── evaluate.py 接口 (与 OnPolicyRollout.student_rollout 同签名) ────
     @torch.no_grad()
     def student_rollout(self, _mem_unused, context_long: str, question: str,
-                        max_new: int, sample: bool = False, temperature: float = 1.0):
+                        max_new: int, sample: bool = False, temperature: float = 1.0,
+                        collect_gate_diagnostics: bool = False):
         from .extract_features import build_chat_prompt_ids
         cq_ids = build_chat_prompt_ids(self.tok, context_long, question, self.device)
         len_cl = self.tok(context_long, return_tensors="pt",
                           add_special_tokens=False).input_ids.shape[1]
         ans_ids = self.generate_from_ids(cq_ids, len_cl, max_new,
-                                         sample=sample, temperature=temperature)
+                                         sample=sample, temperature=temperature,
+                                         collect_gate_diagnostics=collect_gate_diagnostics)
         return None, None, ans_ids

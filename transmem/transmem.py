@@ -8,7 +8,9 @@ TransMem 自己就是一个小自回归 decoder (docs/version2/transmem正常化
          训练 (teacher-forcing 并行): return_all_queries=True -> MS_1..M [B, M, dim]
          推理 (token-by-token):       past_key_values=DynamicCache 增量前向,
                                       每步只喂新 HQ_i [B,1,dim], 读末位 -> MS_i [B, dim]
-  纠正   HQ'_i = HQ_stu_i + a * MS_i            (逐元素相加)
+         final_norm -> gate_proj(可选) -> g_i [B, 1] / [B, M, 1]
+  纠正   legacy: HQ'_i = HQ_stu_i + a * MS_i
+         dynamic: HQ'_i = HQ_stu_i + g_i * MS_i
 
 LLM 全程冻结, TransMem 是唯一可训练模块. out_proj 零初始化使初始 MS=0 -> HQ'=HQ_stu
 恒等, 训练更稳. block 与 backbone 同款, 可选用 backbone 顶部 L 层热启动.
@@ -37,6 +39,23 @@ from .layers import (
     copy_top_layers_from_backbone,
 )
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 结构化读出
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TransMemOutput:
+    """A memory proposal and its token-scalar usage gate."""
+
+    ms: torch.Tensor
+    gate: torch.Tensor
+
+    @property
+    def delta(self) -> torch.Tensor:
+        """Broadcast the scalar gate over the hidden dimension."""
+        return self.gate * self.ms
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -75,6 +94,41 @@ class TransMemConfig:
     learnable_a: bool = False
     warm_start: bool = False       # 是否热启动(权重在 build 后由训练脚本拷入)
 
+    # ── 动态 gate (旧 config 缺字段时保持 constant 严格兼容) ──────────
+    gate_mode: str = "constant"   # constant | centered_sigmoid | sigmoid
+    gate_granularity: str = "token_scalar"
+    gate_max: float = 2.0
+    gate_temperature: float = 1.0
+    gate_init: float = 1.0
+
+    def __post_init__(self) -> None:
+        modes = ("constant", "centered_sigmoid", "sigmoid")
+        if self.gate_mode not in modes:
+            raise ValueError(f"gate_mode 必须是 {modes}, 得到 {self.gate_mode!r}")
+        if self.gate_granularity != "token_scalar":
+            raise ValueError(
+                "第一版只支持 gate_granularity='token_scalar', "
+                f"得到 {self.gate_granularity!r}")
+        if self.gate_temperature <= 0:
+            raise ValueError("gate_temperature 必须 > 0")
+        if self.gate_max <= 0:
+            raise ValueError("gate_max 必须 > 0")
+        if self.gate_mode == "centered_sigmoid" and not (
+                0.0 < self.gate_init < self.gate_max):
+            raise ValueError(
+                "centered_sigmoid 要求 0 < gate_init < gate_max, "
+                f"得到 {self.gate_init} / {self.gate_max}")
+        if self.gate_mode == "sigmoid" and not (0.0 < self.gate_init < 1.0):
+            raise ValueError(
+                "sigmoid 要求 0 < gate_init < 1; 推荐 0.9, "
+                f"得到 {self.gate_init}")
+        if self.gate_mode == "sigmoid" and self.gate_max != 1.0:
+            raise ValueError("sigmoid 范围固定为 0..1，请设置 gate_max=1.0")
+        if self.gate_mode != "constant" and (
+                self.learnable_a or self.a_init != 1.0):
+            raise ValueError(
+                "动态 gate 要求 a_init=1 且 learnable_a=false；实际公式只使用 g*MS")
+
     @classmethod
     def from_json(cls, path: str | Path) -> "TransMemConfig":
         with open(path, "r") as f:
@@ -84,7 +138,17 @@ class TransMemConfig:
 
     def to_dict(self) -> dict:
         from dataclasses import asdict
-        return asdict(self)
+        data = asdict(self)
+        if self.gate_mode == "constant":
+            for name in (
+                "gate_mode",
+                "gate_granularity",
+                "gate_max",
+                "gate_temperature",
+                "gate_init",
+            ):
+                data.pop(name)
+        return data
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -94,11 +158,11 @@ class TransMemConfig:
 class TransMem(nn.Module):
     """记忆偏置网络: L 层 Qwen3 block + 零初始化读出 (自身是小自回归 decoder).
 
-    forward(X) -> MS: 三种用法 (见 forward docstring):
-      默认            X [B, S, dim] -> 读末位 [B, dim]
-      并行读全部 query return_all_queries=True -> [B, S-N, dim]  (训练)
+    forward(X) -> TransMemOutput: 三种用法 (见 forward docstring):
+      默认            ms [B, dim], gate [B, 1]
+      并行读全部 query ms [B, S-N, dim], gate [B, S-N, 1]  (训练)
       增量 KV cache    past_key_values + use_cache=True          (token-by-token 推理)
-    correct(MS, HQ_stu) -> HQ':  HQ'_i = HQ_stu_i + a*MS_i (广播逐元素).
+    correct(HQ_stu, proposal) -> HQ': legacy 用 a*MS, dynamic 用 gate*MS.
     唯一可训练模块 (LLM 冻结).
     """
 
@@ -121,6 +185,8 @@ class TransMem(nn.Module):
 
         # 读出: 零初始化 -> 初始 MS=0 -> HQ'=HQ_stu 恒等
         self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.gate_proj = (nn.Linear(dim, 1, bias=True)
+                          if config.gate_mode != "constant" else None)
 
         # learned 位置: 零初始化 -> 初始不扰动输入 (覆盖 N 记忆槽 + max_queries 个 query 位)
         if config.pos_mode == "learned":
@@ -157,6 +223,15 @@ class TransMem(nn.Module):
             nn.init.zeros_(self.out_proj.weight)
         else:
             nn.init.normal_(self.out_proj.weight, mean=0.0, std=std)
+        if self.gate_proj is not None:
+            nn.init.zeros_(self.gate_proj.weight)
+            if self.config.gate_mode == "centered_sigmoid":
+                ratio = self.config.gate_init / self.config.gate_max
+            else:
+                ratio = self.config.gate_init
+            bias = self.config.gate_temperature * torch.logit(
+                torch.tensor(ratio, dtype=self.gate_proj.bias.dtype))
+            nn.init.constant_(self.gate_proj.bias, float(bias))
 
     # ── 热启动: 由训练脚本传入已加载的 backbone ──────────────────────
     def warm_start_from(self, backbone) -> None:
@@ -167,12 +242,21 @@ class TransMem(nn.Module):
         if self.config.zero_init_out:
             nn.init.zeros_(self.out_proj.weight)
 
-    # ── 前向: X -> MS ─────────────────────────────────────────────────
+    def _read_gate(self, hidden: torch.Tensor, ms: torch.Tensor) -> torch.Tensor:
+        """Read a token-scalar gate from post-final-norm hidden states."""
+        if self.gate_proj is None:
+            return torch.ones(*ms.shape[:-1], 1, dtype=ms.dtype, device=ms.device)
+        logits = self.gate_proj(hidden) / self.config.gate_temperature
+        if self.config.gate_mode == "centered_sigmoid":
+            return self.config.gate_max * torch.sigmoid(logits)
+        return torch.sigmoid(logits)
+
+    # ── 前向: X -> (MS, gate) ─────────────────────────────────────────
     def forward(self, X: torch.Tensor,
                 past_key_values=None,
                 use_cache: bool = False,
-                return_all_queries: bool = False) -> torch.Tensor:
-        """X: [B, S, dim] -> MS.
+                return_all_queries: bool = False) -> TransMemOutput:
+        """X: [B, S, dim] -> memory proposal.
 
         三种用法:
           1) 默认: 一次前向, 读末位 -> [B, dim].
@@ -226,14 +310,22 @@ class TransMem(nn.Module):
 
         h = self.final_norm(h)
         if return_all_queries:
-            return self.out_proj(h[:, self.config.n_mem:, :])   # 全部 query 位 [B, S-N, dim]
-        ms = self.out_proj(h[:, -1, :])                         # 读末位 = 当前查询 [B, dim]
-        return ms
+            query_hidden = h[:, self.config.n_mem:, :]
+        else:
+            query_hidden = h[:, -1, :]
+        ms = self.out_proj(query_hidden)
+        gate = self._read_gate(query_hidden, ms)
+        return TransMemOutput(ms=ms, gate=gate)
 
-    # ── 读出: HQ' = HQ_stu + a*MS ────────────────────────────────────
-    def correct(self, ms: torch.Tensor, hq_stu: torch.Tensor) -> torch.Tensor:
-        """HQ'_i = HQ_stu_i + a*MS_i.  ms, hq_stu: [B, dim] 或 [B, M, dim] (逐元素)."""
-        return hq_stu + self.a * ms
+    # ── 读出: legacy a*MS / dynamic gate*MS ───────────────────────────
+    def correct(self, hq_stu: torch.Tensor, proposal: TransMemOutput) -> torch.Tensor:
+        """Apply one memory proposal through the model's single correction seam."""
+        if not isinstance(proposal, TransMemOutput):
+            raise TypeError(
+                "proposal 必须是 TransMemOutput；请先调用 mem(...)，不要在调用者手写注入公式")
+        delta = (self.a * proposal.ms
+                 if self.config.gate_mode == "constant" else proposal.delta)
+        return hq_stu + delta.to(hq_stu.dtype)
 
     @property
     def dim(self) -> int:

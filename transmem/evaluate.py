@@ -22,6 +22,7 @@ plan §9.6: 先验证"教师确实比学生准"(teacher >> student), 再谈 Tran
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import string
@@ -58,6 +59,8 @@ def parse_args():
     p.add_argument("--attn_impl", default="flash_attention_2",
                    choices=["flash_attention_2", "sdpa", "eager"])
     p.add_argument("--print_examples", type=int, default=3)
+    p.add_argument("--gate_diagnostics", default=None,
+                   help="可选 JSON 路径: 保存逐样本/逐 token/逐层 gate 轨迹")
     return p.parse_args()
 
 
@@ -82,12 +85,15 @@ def score(pred: str, gold: str) -> tuple[int, int]:
 
 class Evaluator:
     def __init__(self, args):
+        if args.gate_diagnostics and args.mode != "transmem":
+            raise ValueError("--gate_diagnostics 只适用于 --mode transmem")
         self.args = args
         self.device = torch.device(args.device)
         self.dtype = _DTYPE[args.dtype]
         self._load_model()
         self.mem = None
         self.rollout = None
+        self._last_gate_trace = None
         if args.mode == "transmem":
             self._load_transmem()
 
@@ -117,7 +123,7 @@ class Evaluator:
                                               LayeredRollout)
                 lcfg = LayeredConfig.from_dict(cfg_dict)
                 self.mem = TransMemLayered(lcfg).to(self.device, dtype=self.dtype)
-                self.mem.load_state_dict(ckpt["model_state_dict"])
+                self.mem.load_state_dict(ckpt["model_state_dict"], strict=True)
                 self.mem.eval()
                 self.rollout = LayeredRollout(self.model, self.tok, self.device,
                                               self.mem, self.dtype)
@@ -126,7 +132,7 @@ class Evaluator:
                 return
             cfg = TransMemConfig(**cfg_dict)
             self.mem = TransMem(cfg).to(self.device, dtype=self.dtype)
-            self.mem.load_state_dict(ckpt["model_state_dict"])
+            self.mem.load_state_dict(ckpt["model_state_dict"], strict=True)
             print(f"加载 TransMem: {a.ckpt} (step={ckpt.get('global_step')})")
         else:
             cfg = TransMemConfig.from_json(a.config)
@@ -158,7 +164,9 @@ class Evaluator:
         """冻结 LLM + TransMem 贪心逐步解码 (§6): TransMem 在环."""
         _, _, ans_ids = self.rollout.student_rollout(
             self.mem, context_long, question, self.args.max_answer_tokens,
-            sample=False, temperature=1.0)
+            sample=False, temperature=1.0,
+            collect_gate_diagnostics=bool(self.args.gate_diagnostics))
+        self._last_gate_trace = self.rollout.last_gate_trace
         return self.tok.decode(ans_ids, skip_special_tokens=True).strip()
 
     def predict(self, rec) -> str:
@@ -178,11 +186,18 @@ class Evaluator:
         records = load_records(a.eval_file, a.data_format, a.max_samples)
         n_exact = n_contain = n = 0
         examples = []
+        gate_traces = []
         for rec in tqdm(records, desc=f"eval[{a.mode}]", unit="q"):
             gold = rec["ground_truth"]
             if not gold:
                 continue
             pred = self.predict(rec)
+            if a.mode == "transmem" and a.gate_diagnostics and self._last_gate_trace:
+                gate_traces.append({
+                    "sample_idx": rec.get("sample_idx", n),
+                    "question": rec.get("question", ""),
+                    **self._last_gate_trace,
+                })
             e, c = score(pred, gold)
             n_exact += e
             n_contain += c
@@ -198,7 +213,62 @@ class Evaluator:
         for q, g, p, e, c in examples:
             print(f"  Q: {q}\n    gold={g!r}  pred={p!r}  exact={e} contains={c}")
         print("=" * 72)
+        if a.gate_diagnostics:
+            path = Path(a.gate_diagnostics)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            summary = summarize_gate_traces(gate_traces)
+            path.write_text(json.dumps(
+                {"samples": gate_traces, "summary": summary},
+                indent=2, ensure_ascii=False))
+            for layer, values in summary["layers"].items():
+                print(f"  gate[{layer}]: mean={values['mean']:.3f} "
+                      f"std={values['std']:.3f} p10/50/90="
+                      f"{values['p10']:.3f}/{values['p50']:.3f}/{values['p90']:.3f} "
+                      f"<.25={values['frac_lt_025']:.3f} >1.75={values['frac_gt_175']:.3f}")
+            print(f"Gate diagnostics: {path}")
         return {"exact": n_exact / max(n, 1), "contains": n_contain / max(n, 1), "n": n}
+
+
+def summarize_gate_traces(traces: list[dict]) -> dict:
+    """Aggregate per-layer distributions and answer-position gate curves."""
+    by_layer: dict[str, dict[str, list[float]]] = {}
+    by_position: dict[str, list[list[float]]] = {}
+    for sample in traces:
+        for layer, values in sample.get("layers", {}).items():
+            target = by_layer.setdefault(
+                str(layer), {"gate": [], "ms_norm": [], "delta_norm": []})
+            for name in target:
+                target[name].extend(float(value) for value in values.get(name, []))
+            positions = by_position.setdefault(str(layer), [])
+            for index, value in enumerate(values.get("gate", [])):
+                while len(positions) <= index:
+                    positions.append([])
+                positions[index].append(float(value))
+
+    layers = {}
+    curves = {}
+    for layer, values in by_layer.items():
+        gate = torch.tensor(values["gate"], dtype=torch.float32)
+        if gate.numel() == 0:
+            continue
+        quantiles = torch.quantile(gate, torch.tensor([0.1, 0.5, 0.9]))
+        layers[layer] = {
+            "count": int(gate.numel()),
+            "mean": float(gate.mean()),
+            "std": float(gate.std(unbiased=False)),
+            "p10": float(quantiles[0]),
+            "p50": float(quantiles[1]),
+            "p90": float(quantiles[2]),
+            "frac_lt_025": float((gate < 0.25).float().mean()),
+            "frac_gt_175": float((gate > 1.75).float().mean()),
+            "ms_norm_mean": float(torch.tensor(values["ms_norm"]).mean()),
+            "delta_norm_mean": float(torch.tensor(values["delta_norm"]).mean()),
+        }
+        curves[layer] = [
+            {"token_index": index, "mean": sum(items) / len(items), "count": len(items)}
+            for index, items in enumerate(by_position[layer]) if items
+        ]
+    return {"layers": layers, "token_index_curves": curves}
 
 
 def main():

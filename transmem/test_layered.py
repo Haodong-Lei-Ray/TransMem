@@ -109,12 +109,15 @@ def test_3_forward_equiv():
     B, D, N, M = 2, 2, cfg.n_mem, 5
     hm = torch.randn(B, D, N, DIM)
     h_in = torch.randn(B, D, M, DIM)
-    ms = layered(hm, h_in)
-    assert ms.shape == (B, D, M, DIM)
+    output = layered(hm, h_in)
+    assert output.ms.shape == (B, D, M, DIM)
+    assert output.gate.shape == (B, D, M, 1)
     for k, l in enumerate(cfg.inject_layers):
         X = torch.cat([hm[:, k], h_in[:, k]], dim=1)
         ref = layered.block(l)(X, return_all_queries=True)
-        assert torch.allclose(ms[:, k], ref, atol=1e-6), f"[3] 层 {l} 不等价"
+        assert torch.allclose(output.ms[:, k], ref.ms, atol=1e-6), f"[3] 层 {l} MS 不等价"
+        assert torch.allclose(output.gate[:, k], ref.gate, atol=1e-6), \
+            f"[3] 层 {l} gate 不等价"
     print("[3] PASS forward 堆叠 == 逐块前向")
 
 

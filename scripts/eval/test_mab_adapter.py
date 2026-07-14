@@ -102,11 +102,15 @@ class FakeModel:
 
 
 class ZeroCorrectionMemory:
-    a = 1.0
-
     def __call__(self, memory_input, past_key_values=None, use_cache=True):
+        from transmem import TransMemOutput
+
         del past_key_values, use_cache
-        return torch.zeros_like(memory_input[:, -1, :])
+        ms = torch.zeros_like(memory_input[:, -1, :])
+        return TransMemOutput(ms=ms, gate=torch.ones_like(ms[:, :1]))
+
+    def correct(self, hq, proposal):
+        return hq + proposal.delta
 
 
 def tensor_prompt_builder(tokenizer, context, question, device=None):
