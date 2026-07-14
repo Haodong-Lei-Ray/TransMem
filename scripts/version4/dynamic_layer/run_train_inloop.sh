@@ -78,23 +78,4 @@ echo "Model=$MODEL_PATH S=$S D=$D layers=$((S-D))..$((S-1)) N=4 POLICY=$POLICY"
   --log_interval 25 --val_interval "${VAL_INTERVAL:-250}" --save_interval 500 \
   ${EXTRA:-}
 
-# Keep the best/result artifacts in object storage, then remove only redundant
-# local restart snapshots after verifying the uploaded best checkpoint size.
-S3_CKPT=s3://datafrontier/leihaodong/Project4/checkpoints/$(basename "$OUTPUT_DIR")
-for file in best.pt result.json; do
-  if [[ -f "$OUTPUT_DIR/$file" ]]; then
-    aws s3 cp "$OUTPUT_DIR/$file" "$S3_CKPT/$file" \
-      --endpoint-url "$ENDPOINT" --only-show-errors
-  fi
-done
-LOCAL_SIZE=$(stat -c %s "$OUTPUT_DIR/best.pt" 2>/dev/null || echo 0)
-S3_SIZE=$(aws s3 ls "$S3_CKPT/best.pt" --endpoint-url "$ENDPOINT" 2>/dev/null \
-  | awk 'NR == 1 {print $3}' || true)
-if [[ -n "$S3_SIZE" && "$S3_SIZE" = "$LOCAL_SIZE" ]]; then
-  rm -f "$OUTPUT_DIR"/latest.pt "$OUTPUT_DIR"/step_*.pt
-  echo "已归档 $S3_CKPT (best.pt $S3_SIZE B)，本地删除 latest/step_*"
-else
-  echo "WARNING: S3 校验不一致 (local=$LOCAL_SIZE s3=$S3_SIZE)，保留全部 ckpt" >&2
-fi
-
 echo "Qwen3-4B dynamic-layer 训练完成: S=$S D=$D"
