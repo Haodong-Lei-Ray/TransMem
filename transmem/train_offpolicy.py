@@ -53,6 +53,153 @@ from transmem import TransMemConfig, TransMem, DistillLoss, FrozenLMHead
 from transmem.diagnostics import parse_curve_steps
 
 _DTYPE = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+_TRAINING_RECIPE_VERSION = 1
+_DEFERRED_RECIPE_FIELDS = {
+    "training.resolved_total_steps",
+    "training.resolved_schedule_total_steps",
+}
+
+
+def _normalize_path(value) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    return str(Path(str(value).strip()).expanduser().resolve())
+
+
+def _normalize_data_dirs(value) -> list[str]:
+    if value is None:
+        return []
+    return [
+        str(Path(part.strip()).expanduser().resolve())
+        for part in str(value).split(",")
+        if part.strip()
+    ]
+
+
+def build_training_recipe(
+    args,
+    config: dict,
+    *,
+    world_size: int,
+    resolved_total_steps: int | None = None,
+    resolved_schedule_total_steps: int | None = None,
+) -> dict:
+    """Build the canonical weight-affecting recipe persisted in checkpoints."""
+
+    data_dirs = _normalize_data_dirs(getattr(args, "data_dir", None))
+    val_data_dirs = _normalize_data_dirs(getattr(args, "val_data_dir", None))
+    raw_max_steps = getattr(args, "max_steps", None)
+    raw_schedule_steps = getattr(args, "schedule_total_steps", None)
+    if resolved_total_steps is None and raw_max_steps is not None:
+        resolved_total_steps = int(raw_max_steps)
+    if resolved_schedule_total_steps is None:
+        if raw_schedule_steps is not None:
+            resolved_schedule_total_steps = int(raw_schedule_steps)
+        elif resolved_total_steps is not None:
+            resolved_schedule_total_steps = int(resolved_total_steps)
+
+    lm_head_path = getattr(args, "lm_head_path", None)
+    if not lm_head_path and data_dirs:
+        lm_head_path = str(Path(data_dirs[0]) / "lm_head.pt")
+    curve_steps = sorted({
+        int(step) for step in (getattr(args, "curve_steps", None) or [])
+    })
+    batch_size = int(getattr(args, "batch_size", 0))
+    world_size = int(world_size)
+
+    return {
+        "schema_version": _TRAINING_RECIPE_VERSION,
+        "seed": getattr(args, "seed", None),
+        "data": {
+            "data_dirs": data_dirs,
+            "val_data_dirs": val_data_dirs,
+            "lm_head_path": _normalize_path(lm_head_path),
+        },
+        "model": {
+            "config_path": _normalize_path(getattr(args, "config", None)),
+            "config": json.loads(json.dumps(config, sort_keys=True)),
+            "warm_start_model_path": _normalize_path(
+                getattr(args, "model_path", None)),
+        },
+        "training": {
+            "epochs": int(getattr(args, "epochs", 0)),
+            "max_steps": None if raw_max_steps is None else int(raw_max_steps),
+            "resolved_total_steps": (
+                None if resolved_total_steps is None else int(resolved_total_steps)),
+            "schedule_total_steps": (
+                None if raw_schedule_steps is None else int(raw_schedule_steps)),
+            "resolved_schedule_total_steps": (
+                None if resolved_schedule_total_steps is None
+                else int(resolved_schedule_total_steps)),
+            "curve_steps": curve_steps,
+            "overfit_batch": bool(getattr(args, "overfit_batch", False)),
+        },
+        "optimizer": {
+            "name": "AdamW",
+            "lr": float(getattr(args, "lr", 0.0)),
+            "weight_decay": float(getattr(args, "weight_decay", 0.0)),
+            "betas": [0.9, 0.999],
+            "batch_size_per_rank": batch_size,
+            "world_size": world_size,
+            "global_batch_size": batch_size * world_size,
+            "warmup_steps": int(getattr(args, "warmup_steps", 0)),
+            "grad_clip": float(getattr(args, "grad_clip", 0.0)),
+            "dtype": str(getattr(args, "dtype", "")),
+        },
+        "loss": {
+            "name": str(getattr(args, "loss", "kd")),
+            "divergence": str(getattr(args, "divergence", "forward_kl")),
+            "temperature": float(getattr(args, "temperature", 1.0)),
+            "reg_weight": float(getattr(args, "reg_weight", 0.0)),
+            "jsd_beta": float(getattr(args, "jsd_beta", 0.5)),
+        },
+    }
+
+
+def validate_resume_recipe(
+    saved_recipe,
+    current_recipe: dict,
+    *,
+    require_recipe: bool,
+    allow_unresolved: bool = False,
+) -> None:
+    """Fail closed on recipe drift while retaining legacy ordinary resume."""
+
+    if saved_recipe is None:
+        if require_recipe:
+            raise ValueError(
+                "resume checkpoint is missing training_recipe; "
+                "curve runs require a provenanced latest.pt")
+        return
+    if not isinstance(saved_recipe, dict):
+        raise ValueError("checkpoint training_recipe must be a dict")
+
+    mismatches: list[str] = []
+
+    def compare(saved, current, path: str) -> None:
+        if allow_unresolved and path in _DEFERRED_RECIPE_FIELDS and current is None:
+            return
+        if isinstance(saved, dict) and isinstance(current, dict):
+            for key in sorted(set(saved) | set(current)):
+                child = f"{path}.{key}" if path else key
+                if key not in saved:
+                    mismatches.append(f"{child}: missing from checkpoint")
+                elif key not in current:
+                    mismatches.append(f"{child}: missing from current recipe")
+                else:
+                    compare(saved[key], current[key], child)
+            return
+        if saved != current:
+            mismatches.append(
+                f"{path}: checkpoint={saved!r}, current={current!r}")
+
+    compare(saved_recipe, current_recipe, "")
+    if mismatches:
+        details = "\n  - ".join(mismatches[:20])
+        extra = "" if len(mismatches) <= 20 else (
+            f"\n  - ... and {len(mismatches) - 20} more")
+        raise ValueError(
+            f"resume training_recipe mismatch:\n  - {details}{extra}")
 
 
 def curve_checkpoint_path(output_dir, step: int) -> Path:
@@ -61,7 +208,8 @@ def curve_checkpoint_path(output_dir, step: int) -> Path:
 
 def save_curve_checkpoint(path: str | Path, *, model, config: dict,
                           global_step: int, epoch: int, seed: int | None,
-                          schedule_total_steps: int) -> None:
+                          schedule_total_steps: int,
+                          training_recipe: dict | None = None) -> None:
     """Atomically save a model-only checkpoint used by free-generation curves."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +222,8 @@ def save_curve_checkpoint(path: str | Path, *, model, config: dict,
         "seed": seed,
         "schedule_total_steps": int(schedule_total_steps),
     }
+    if training_recipe is not None:
+        checkpoint["training_recipe"] = training_recipe
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(checkpoint, tmp)
     os.replace(tmp, path)
@@ -349,6 +499,9 @@ class OffPolicyTrainer:
         # model initialization, not merely the data order.
         seed_everything(getattr(args, "seed", None))
         self.config = TransMemConfig.from_json(args.config)
+        self.training_recipe = build_training_recipe(
+            args, self.config.to_dict(), world_size=self.world)
+        self._resume_recipe = None
         assert self.config.causal, (
             "序列级 off-policy 训练依赖 causal mask (尾部 padding 不可见 + "
             "query 只看历史); causal=false 与 token-by-token 推理语义不兼容")
@@ -505,7 +658,7 @@ class OffPolicyTrainer:
         Path(path).mkdir(parents=True, exist_ok=True)
         base = {"model_state_dict": self.mem.state_dict(),
                 "config": self.config.to_dict(), "global_step": self.global_step,
-                "epoch": self.epoch}
+                "epoch": self.epoch, "training_recipe": self.training_recipe}
         if metrics:
             base["metrics"] = metrics
         # latest.pt 带 optimizer (断点续训需要); best/final 只存 model_state_dict —
@@ -540,11 +693,24 @@ class OffPolicyTrainer:
             epoch=self.epoch,
             seed=getattr(self.args, "seed", None),
             schedule_total_steps=schedule_total_steps,
+            training_recipe=self.training_recipe,
         )
         print(f"  Curve checkpoint saved: {path.name} (model-only)")
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        current_recipe = build_training_recipe(
+            self.args, self.config.to_dict(), world_size=self.world)
+        require_recipe = bool(getattr(self.args, "curve_steps", None))
+        saved_recipe = ckpt.get("training_recipe")
+        validate_resume_recipe(
+            saved_recipe, current_recipe, require_recipe=require_recipe,
+            allow_unresolved=True)
+        if require_recipe and "optimizer_state_dict" not in ckpt:
+            raise ValueError(
+                "curve resume requires latest.pt with optimizer_state_dict")
+        self._resume_recipe = saved_recipe
+        self.training_recipe = current_recipe
         self.mem.load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:          # best.pt 是 model-only, 无 optimizer
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -552,6 +718,8 @@ class OffPolicyTrainer:
         self.epoch = ckpt.get("epoch", 0)
         self._load_result()   # 恢复 best_val, 避免 resume 后覆盖历史最优
         if self.is_main:
+            if saved_recipe is None:
+                print("[WARN] legacy checkpoint has no training_recipe")
             print(f"Resumed: step={self.global_step}, best_val={self.best_val:.6f}")
 
     def _result_path(self):
@@ -602,6 +770,14 @@ class OffPolicyTrainer:
             total_steps, getattr(args, "schedule_total_steps", None))
         requested_curve_steps = set(getattr(args, "curve_steps", None) or [])
         curve_steps = {step for step in requested_curve_steps if step > 0}
+        resolved_recipe = build_training_recipe(
+            args, self.config.to_dict(), world_size=self.world,
+            resolved_total_steps=total_steps,
+            resolved_schedule_total_steps=schedule_total_steps)
+        if self._resume_recipe is not None:
+            validate_resume_recipe(
+                self._resume_recipe, resolved_recipe, require_recipe=True)
+        self.training_recipe = resolved_recipe
         if self.is_main:
             print(f"\n训练: steps/epoch≈{len(train_dl)}, total≈{total_steps}, "
                   f"bs={args.batch_size} 序列/rank x {self.world} rank "

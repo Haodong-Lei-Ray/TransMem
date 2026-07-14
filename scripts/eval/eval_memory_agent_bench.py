@@ -14,6 +14,7 @@ plus a top-level index containing only the per-source summaries.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -31,7 +32,9 @@ PROJECT4_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAB_ROOT = Path(
     "/mnt/petrelfs/leihaodong/Project1/MemoryAgentBenchProject/MemoryAgentBench"
 )
-MAX_PROMPT_TOKENS = 128_000
+AGENT_INPUT_TOKENS = 128_000
+AGENT_BUFFER_TOKENS = 4_000
+MAX_PROMPT_TOKENS = AGENT_INPUT_TOKENS
 LONG_CONTEXT_AGENT_NAME = "Long_context_agent_Qwen3-4B-Instruct-2507"
 
 
@@ -78,6 +81,21 @@ MAIN_SOURCE_SPECS: dict[str, SourceSpec] = {
 }
 
 
+def source_prompt_budget(source: str) -> int:
+    """Return the official Qwen prompt budget for one MAB source."""
+
+    try:
+        generation_tokens = MAIN_SOURCE_SPECS[source].max_new_tokens
+    except KeyError as exc:
+        raise ValueError(f"unknown MemoryAgentBench source: {source}") from exc
+    budget = AGENT_INPUT_TOKENS - AGENT_BUFFER_TOKENS - generation_tokens
+    if budget <= 0:
+        raise ValueError(
+            f"{source} has no prompt budget after reserving "
+            f"{AGENT_BUFFER_TOKENS} buffer and {generation_tokens} generation tokens")
+    return budget
+
+
 @dataclass(frozen=True)
 class QueryRecord:
     key: str
@@ -88,6 +106,9 @@ class QueryRecord:
     formatted_query: str
     answer: Any
     qa_pair_id: Any = None
+    question_id: Any = None
+    question_type: Any = None
+    keypoints: Any = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +166,14 @@ def build_query_records(
             f"{source} context {context_index}: {len(questions)} questions but "
             f"{len(answers)} answers")
     template = get_template(source, "query", LONG_CONTEXT_AGENT_NAME)
+    metadata = row.get("metadata") or {}
+    keypoints = None
+    if isinstance(metadata, Mapping):
+        keypoints = metadata.get("keypoints")
+        if keypoints is None:
+            keypoints = metadata.get("summary/short_keypoints")
+    if keypoints is None:
+        keypoints = row.get("keypoints")
     records: list[QueryRecord] = []
     indexed_fields = (
         "question_dates", "question_types", "question_ids",
@@ -173,6 +202,9 @@ def build_query_records(
             formatted_query=formatted_query,
             answer=answer,
             qa_pair_id=_indexed_value(row, "qa_pair_ids", qi),
+            question_id=_indexed_value(row, "question_ids", qi),
+            question_type=_indexed_value(row, "question_types", qi),
+            keypoints=keypoints,
         ))
     return records
 
@@ -392,6 +424,16 @@ def summarize_source_rows(
         summary["transmem_primary"] = summary["transmem"].get(spec.primary_metric)
     else:
         summary["score_status"] = "proxy_metrics_only; official score requires judge"
+    if source == "longmemeval_s*":
+        summary.update({
+            "evaluation_scope": "in_domain",
+            "cross_domain_generalization_claim_allowed": False,
+            "contamination_status": "overlap_not_measured_by_adapter",
+            "interpretation_note": (
+                "P1 was trained on LongMemEval-family data. Treat this as in-domain "
+                "evaluation; an external manifest overlap audit is required before "
+                "making any contamination-adjusted claim."),
+        })
     return summary
 
 
@@ -440,17 +482,44 @@ def find_split_parquets(
             search_roots.extend(sorted(
                 (hub / "datasets--ai-hyz--MemoryAgentBench" / "snapshots").glob(
                     "*/data")))
-    matches: list[Path] = []
+    unique_roots: list[Path] = []
+    seen_roots: set[Path] = set()
     for root in search_roots:
+        resolved_root = root.resolve()
+        if resolved_root not in seen_roots:
+            seen_roots.add(resolved_root)
+            unique_roots.append(root)
+
+    groups: list[tuple[Path, list[Path]]] = []
+    for root in unique_roots:
+        matches: list[Path] = []
         if root.is_file() and root.name.startswith(f"{split}-"):
             matches.append(root)
         elif root.exists():
             matches.extend(root.rglob(f"{split}-*.parquet"))
-    unique = sorted({path.resolve() for path in matches})
-    if not unique:
-        roots = ", ".join(str(path) for path in search_roots)
+        resolved_matches = [path.resolve() for path in matches]
+        names: dict[str, list[Path]] = defaultdict(list)
+        for path in resolved_matches:
+            names[path.name].append(path)
+        duplicate_names = sorted(
+            name for name, paths in names.items() if len(set(paths)) > 1)
+        if len(resolved_matches) != len(set(resolved_matches)) or duplicate_names:
+            details = ", ".join(duplicate_names) or "same resolved file"
+            raise ValueError(
+                f"duplicate parquet shard for split {split} under {root.resolve()}: "
+                f"{details}")
+        unique = sorted(set(resolved_matches))
+        if unique:
+            groups.append((root.resolve(), unique))
+    if not groups:
+        roots = ", ".join(str(path) for path in unique_roots)
         raise FileNotFoundError(f"no local parquet for split {split}; searched: {roots}")
-    return unique
+    if len(groups) > 1:
+        roots = ", ".join(str(root) for root, _ in groups)
+        raise ValueError(
+            f"multiple local dataset roots contain split {split}: {roots}; "
+            "pass one explicit --data_dir")
+    return groups[0][1]
 
 
 def load_rows_by_source(
@@ -515,6 +584,65 @@ def _write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def write_summary_index(
+    output_dir: Path,
+    run_id: str,
+    summaries: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge per-source summaries into the shared index under one file lock."""
+
+    lock_path = output_dir / ".summary.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            indexed_summaries: dict[str, Any] = {}
+            for summary_path in output_dir.glob("*.summary.json"):
+                with summary_path.open(encoding="utf-8") as handle:
+                    saved = json.load(handle)
+                if saved.get("run_id") == run_id and saved.get("source"):
+                    indexed_summaries[saved["source"]] = saved
+            indexed_summaries.update(summaries)
+            index = {
+                "benchmark": "MemoryAgentBench main-13",
+                "aggregation": (
+                    "per_source_only (the official benchmark defines no overall)"),
+                "run_id": run_id,
+                "sources": indexed_summaries,
+            }
+            _write_json(output_dir / "summary.json", index)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return index
+
+
+def resolve_checkpoint_step(
+    *,
+    runner_step: Any,
+    rows: Sequence[Mapping[str, Any]],
+    previous_summary: Mapping[str, Any] | None,
+    run_id: str,
+) -> int:
+    """Resolve one non-null checkpoint step without loading model weights."""
+
+    candidates: set[int] = set()
+    if runner_step is not None:
+        candidates.add(int(runner_step))
+    for row in rows:
+        step = row.get("checkpoint_step")
+        if step is not None:
+            candidates.add(int(step))
+    if previous_summary and previous_summary.get("run_id") == run_id:
+        step = previous_summary.get("checkpoint_step")
+        if step is not None:
+            candidates.add(int(step))
+    if not candidates:
+        raise ValueError(
+            "checkpoint_step is unavailable from runner, progress, and prior summary")
+    if len(candidates) != 1:
+        raise ValueError(f"conflicting checkpoint_step values: {sorted(candidates)}")
+    return next(iter(candidates))
+
+
 class PairedTransMemGreedy:
     """Frozen Qwen + P1 TransMem with paired, cache-restored greedy decoding."""
 
@@ -562,13 +690,18 @@ class PairedTransMemGreedy:
         return self.build_chat_prompt_ids(
             self.tokenizer, context, question, self.device)
 
-    def plan_context(self, context: str, questions: Sequence[str]) -> ContextWindow:
+    def plan_context(
+        self,
+        context: str,
+        questions: Sequence[str],
+        max_prompt_tokens: int,
+    ) -> ContextWindow:
         return plan_context_window(
             self.tokenizer,
             context,
             questions,
             self.build_chat_prompt_ids,
-            MAX_PROMPT_TOKENS,
+            max_prompt_tokens,
         )
 
     def _extract_hm(self, hidden, context_tokens: int):
@@ -648,11 +781,19 @@ class PairedTransMemGreedy:
         max_new_tokens: int,
         no_prefix_cache: bool,
         window_questions: Sequence[str] | None = None,
+        max_prompt_tokens: int | None = None,
     ) -> tuple[ContextWindow, list[dict[str, Any]]]:
         torch = self.torch
+        if max_prompt_tokens is None:
+            max_prompt_tokens = (
+                AGENT_INPUT_TOKENS - AGENT_BUFFER_TOKENS - max_new_tokens)
+        if max_prompt_tokens + max_new_tokens + AGENT_BUFFER_TOKENS > AGENT_INPUT_TOKENS:
+            raise ValueError(
+                "prompt, generation, and buffer budgets exceed the agent input limit")
         # Window planning must include already-completed questions too.  Otherwise
         # a resumed run could retain more context than its first invocation.
-        window = self.plan_context(context, window_questions or questions)
+        window = self.plan_context(
+            context, window_questions or questions, max_prompt_tokens)
         prompts = [self._prompt(window.context, question) for question in questions]
         context_tokens = len(_encode(self.tokenizer, window.context))
         predictions: list[dict[str, Any]] = []
@@ -742,6 +883,61 @@ def _file_fingerprint(path: Path) -> dict[str, Any]:
     }
 
 
+_MODEL_IDENTITY_FILES = (
+    "config.json",
+    "generation_config.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "vocab.json",
+    "merges.txt",
+    "chat_template.jinja",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+)
+
+
+def _content_fingerprint(path: Path) -> dict[str, Any]:
+    before = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(f"model identity file changed while reading: {path}")
+    return {"size": after.st_size, "sha256": digest.hexdigest()}
+
+
+def _model_fingerprint(model_root: Path) -> dict[str, Any]:
+    """Identify a model without depending on an ephemeral S3 mount path."""
+
+    model_root = model_root.resolve()
+    config_path = model_root / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"model config is missing: {config_path}")
+    metadata = {
+        name: _content_fingerprint(model_root / name)
+        for name in _MODEL_IDENTITY_FILES
+        if (model_root / name).is_file()
+    }
+    weight_paths = set(model_root.glob("*.safetensors"))
+    weight_paths.update(model_root.glob("*.bin"))
+    weights = [
+        {"name": path.name, "size": path.stat().st_size}
+        for path in sorted(weight_paths, key=lambda item: item.name)
+        if path.is_file()
+    ]
+    if not weights:
+        raise FileNotFoundError(f"model weights are missing under: {model_root}")
+    return {
+        "repository_name": model_root.name,
+        "metadata": metadata,
+        "weights": weights,
+    }
+
+
 def _run_id(args: argparse.Namespace) -> str:
     checkpoint = Path(args.ckpt).resolve()
     model_root = Path(args.model_path).resolve()
@@ -751,8 +947,7 @@ def _run_id(args: argparse.Namespace) -> str:
         for path in find_split_parquets(split, args.mab_root, args.data_dir)
     ]
     payload = {
-        "model_path": str(model_root),
-        "model_config": _file_fingerprint(model_root / "config.json"),
+        "model": _model_fingerprint(model_root),
         "checkpoint": _file_fingerprint(checkpoint),
         "mab_templates": _file_fingerprint(args.mab_root / "utils" / "templates.py"),
         "mab_metrics": _file_fingerprint(
@@ -761,7 +956,8 @@ def _run_id(args: argparse.Namespace) -> str:
         "source_specs": {
             source: spec.__dict__ for source, spec in MAIN_SOURCE_SPECS.items()
         },
-        "max_prompt_tokens": MAX_PROMPT_TOKENS,
+        "agent_input_tokens": AGENT_INPUT_TOKENS,
+        "agent_buffer_tokens": AGENT_BUFFER_TOKENS,
         "prefix_cache": not args.no_prefix_cache,
         "max_questions_per_source": args.max_questions_per_source,
         "dtype": args.dtype,
@@ -872,6 +1068,7 @@ def main() -> None:
                     args.no_prefix_cache,
                     window_questions=[
                         record.formatted_query for record in records],
+                    max_prompt_tokens=source_prompt_budget(source),
                 )
                 for record, prediction in zip(missing, paired):
                     student_metrics, student_details = score_prediction(
@@ -882,11 +1079,15 @@ def main() -> None:
                         post_process, args.mab_root)
                     result = {
                         "run_id": run_id,
+                        "checkpoint_step": runner.checkpoint_step,
                         "key": record.key,
                         "source": source,
                         "context_index": record.context_index,
                         "question_index": record.question_index,
                         "qa_pair_id": record.qa_pair_id,
+                        "question_id": record.question_id,
+                        "question_type": record.question_type,
+                        "keypoints": record.keypoints,
                         "question": record.question,
                         "formatted_query": record.formatted_query,
                         "answer": record.answer,
@@ -899,7 +1100,10 @@ def main() -> None:
                         "context_tokens_original": window.original_context_tokens,
                         "context_tokens_kept": window.kept_context_tokens,
                         "context_tokens_left_truncated": window.left_truncated_tokens,
-                        "max_prompt_tokens": MAX_PROMPT_TOKENS,
+                        "agent_input_tokens": AGENT_INPUT_TOKENS,
+                        "buffer_token_budget": AGENT_BUFFER_TOKENS,
+                        "generation_token_budget": spec.max_new_tokens,
+                        "prompt_token_budget": source_prompt_budget(source),
                     }
                     progress.write(json.dumps(
                         _jsonable(result), ensure_ascii=False) + "\n")
@@ -922,19 +1126,32 @@ def main() -> None:
             if record.key in done
         ]
         expected = sum(len(records) for _, records in source_records[source])
+        summary_path = output_dir / f"{_safe_source_name(source)}.summary.json"
+        previous_summary = None
+        if summary_path.is_file():
+            with summary_path.open(encoding="utf-8") as handle:
+                previous_summary = json.load(handle)
+        checkpoint_step = resolve_checkpoint_step(
+            runner_step=getattr(runner, "checkpoint_step", None),
+            rows=ordered,
+            previous_summary=previous_summary,
+            run_id=run_id,
+        )
         summary = summarize_source_rows(source, ordered, expected_questions=expected)
         summary.update({
             "run_id": run_id,
             "model_path": str(Path(args.model_path).resolve()),
             "checkpoint": str(Path(args.ckpt).resolve()),
-            "checkpoint_step": getattr(runner, "checkpoint_step", None),
+            "checkpoint_step": checkpoint_step,
             "decode": "paired_greedy",
             "prompt_format": "Project4 build_chat_prompt_ids",
-            "max_prompt_tokens": MAX_PROMPT_TOKENS,
+            "agent_input_tokens": AGENT_INPUT_TOKENS,
+            "buffer_token_budget": AGENT_BUFFER_TOKENS,
+            "generation_token_budget": spec.max_new_tokens,
+            "prompt_token_budget": source_prompt_budget(source),
             "prefix_cache": not args.no_prefix_cache,
             "progress_jsonl": str(progress_path.resolve()),
         })
-        summary_path = output_dir / f"{_safe_source_name(source)}.summary.json"
         _write_json(summary_path, summary)
         summaries[source] = summary
         primary = spec.primary_metric
@@ -947,23 +1164,10 @@ def main() -> None:
                 flush=True,
             )
 
-    # Disjoint source subsets may be evaluated by separate jobs.  Rebuild the
-    # index from every completed per-source summary belonging to this run so the
-    # last finisher produces the complete view without inventing an overall.
-    indexed_summaries: dict[str, Any] = {}
-    for summary_path in output_dir.glob("*.summary.json"):
-        with summary_path.open(encoding="utf-8") as handle:
-            saved = json.load(handle)
-        if saved.get("run_id") == run_id and saved.get("source"):
-            indexed_summaries[saved["source"]] = saved
-    indexed_summaries.update(summaries)
-    index = {
-        "benchmark": "MemoryAgentBench main-13",
-        "aggregation": "per_source_only (the official benchmark defines no overall)",
-        "run_id": run_id,
-        "sources": indexed_summaries,
-    }
-    _write_json(output_dir / "summary.json", index)
+    # Disjoint source jobs share this output root.  The lock makes the rescan and
+    # atomic index replacement one transaction, so a late writer cannot publish
+    # a stale subset after another source has finished.
+    write_summary_index(output_dir, run_id, summaries)
     print(f"Wrote per-source summaries to {output_dir.resolve()}")
 
 
