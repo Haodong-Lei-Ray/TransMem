@@ -85,6 +85,8 @@ def score(pred: str, gold: str) -> tuple[int, int]:
 
 class Evaluator:
     def __init__(self, args):
+        if getattr(args, "gate_diagnostics", None) is None:
+            args.gate_diagnostics = None    # SimpleNamespace 复用入口 (eval_locomo 等) 兜底
         if args.gate_diagnostics and args.mode != "transmem":
             raise ValueError("--gate_diagnostics 只适用于 --mode transmem")
         self.args = args

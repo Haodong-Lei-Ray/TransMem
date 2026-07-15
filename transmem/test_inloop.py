@@ -177,7 +177,7 @@ def test_4_trainer_tf():
         import transmem.train_inloop as ti
         orig = ti.InLoopDataset
         ti.InLoopDataset = (lambda data_dir, data_path, data_format, policy="tf",
-                            max_samples=None, records_=records:
+                            max_samples=None, records=None, records_=records:
                             orig(data_dir, data_path, data_format, policy=policy,
                                  max_samples=max_samples, records=records_))
         try:
@@ -226,6 +226,24 @@ def test_5_onpolicy_smoke():
         print(f"[5] PASS onpolicy smoke ({n_step} micro, grad_norm={gn:.3f})")
 
 
+def test_5b_pool_stage0_teacher_only():
+    """Pool Stage0 的 N=None 可供 in-loop 使用，因为这里只读教师字段。"""
+    from transmem.train_inloop import InLoopDataset
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "feat"
+        records = _fake_data(root)
+        meta_path = root / "meta.json"
+        meta = json.loads(meta_path.read_text())
+        meta["N"] = None
+        meta["pool_ns"] = [4, 8]
+        meta_path.write_text(json.dumps(meta))
+        ds = InLoopDataset(str(root), "", "json", policy="tf", records=records)
+        assert ds.teacher_only_pool and ds.N is None and ds.pool_ns == [4, 8]
+        assert len(ds) == len(records)
+        print("[5b] PASS pool Stage0 teacher-only 兼容")
+
+
 def test_6_resume():
     from transmem.train_inloop import InLoopTrainer
 
@@ -236,7 +254,7 @@ def test_6_resume():
         import transmem.train_inloop as ti
         orig = ti.InLoopDataset
         ti.InLoopDataset = (lambda data_dir, data_path, data_format, policy="tf",
-                            max_samples=None, records_=records:
+                            max_samples=None, records=None, records_=records:
                             orig(data_dir, data_path, data_format, policy=policy,
                                  max_samples=max_samples, records=records_))
         try:
@@ -258,5 +276,6 @@ if __name__ == "__main__":
     test_3_deep_credit()
     test_4_trainer_tf()
     test_5_onpolicy_smoke()
+    test_5b_pool_stage0_teacher_only()
     test_6_resume()
     print("\n✅ test_inloop 全部通过")

@@ -87,6 +87,8 @@ def parse_args():
     p.add_argument("--data_format", default="hotpotqa-agentmem")
     p.add_argument("--val_data_dir", default=None)
     p.add_argument("--val_data_path", default=None)
+    p.add_argument("--val_data_format", default=None,
+                   help="val 数据格式 (可逗号分隔; 缺省用 --data_format)")
     p.add_argument("--val_max", type=int, default=128, help="每次 val 的样本上限")
     p.add_argument("--max_samples", type=int, default=None, help="训练集截断 (调试)")
     # 模型/架构
@@ -156,7 +158,15 @@ class InLoopDataset(Dataset):
         self.data_dir = Path(data_dir)
         with open(self.data_dir / "meta.json") as f:
             self.meta = json.load(f)
-        self.N = self.meta["N"]
+        self.N = self.meta.get("N")
+        self.pool_ns = self.meta.get("pool_ns") or []
+        # Pool Stage0 stores N=None because hm_pool can serve several N values.
+        # In-loop training never reads hm_stu/hm_pool: it recomputes HM inside
+        # every injected LLM layer and only consumes answer_ids + hq_tea here.
+        self.teacher_only_pool = self.N is None and bool(self.pool_ns)
+        if self.N is None and not self.teacher_only_pool:
+            raise RuntimeError(
+                f"stage0 meta 既没有 N 也没有 pool_ns: {self.data_dir}")
         if records is None:
             records = load_records(data_path, data_format, None)
         self.records = records
@@ -199,6 +209,26 @@ class InLoopDataset(Dataset):
 def collate_first(batch):
     """batch_size=1 (变长 ~30k token 序列, 不 padding); 直接取样本 dict."""
     return batch[0]
+
+
+def build_inloop_dataset(data_dirs, data_paths, data_formats, policy,
+                         max_samples=None, records=None):
+    """多源混合 (如 hqa+LME 自然混合): 三参均可逗号分隔, path/format 单值时广播.
+    返回 (dataset, sub_datasets) — 上层用 sub 列表做 N/pool 校验."""
+    dirs = [d.strip() for d in str(data_dirs).split(",") if d.strip()]
+    paths = [p.strip() for p in str(data_paths).split(",")]
+    fmts = [f.strip() for f in str(data_formats).split(",") if f.strip()]
+    if len(paths) == 1:
+        paths *= len(dirs)
+    if len(fmts) == 1:
+        fmts *= len(dirs)
+    assert len(dirs) == len(paths) == len(fmts), \
+        f"多源参数长度不一致: dirs={dirs} paths={paths} formats={fmts}"
+    subs = [InLoopDataset(d, p, f, policy=policy, max_samples=max_samples,
+                          records=records)
+            for d, p, f in zip(dirs, paths, fmts)]
+    ds = subs[0] if len(subs) == 1 else torch.utils.data.ConcatDataset(subs)
+    return ds, subs
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -416,7 +446,11 @@ class InLoopTrainer:
         kl_sum, pos, top1_sum = 0.0, 0, 0.0
         gate_sum = gate_std_sum = delta_sum = 0.0
         for i in range(self.rank, n, self.world):
-            r = self.micro_loss(val_ds[i], policy="tf")
+            try:
+                r = self.micro_loss(val_ds[i], policy="tf")
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                continue
             if r is None:
                 continue
             loss, M, m = r
@@ -447,9 +481,21 @@ class InLoopTrainer:
     # ── 保存/恢复 (格式与 train_layered 一致 → evaluate.py 直接分发) ────
     @staticmethod
     def _atomic_torch_save(obj, path: Path):
+        """原子写 + 软失败: 配额满 (共享账号, 他方作业可随时写爆盘) 时 torch.save
+        抛 RuntimeError("file write failed")/OSError — 存不上档不应崩掉 10h 训练,
+        清掉半截 tmp 打警告继续, 旧档保持完好 (2026-07-14/15 两次爆盘实测教训)."""
         tmp = path.with_suffix(path.suffix + ".tmp")
-        torch.save(obj, tmp)
-        os.replace(tmp, path)
+        try:
+            torch.save(obj, tmp)
+            os.replace(tmp, path)
+            return True
+        except (RuntimeError, OSError) as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            print(f"  ⚠️ 存档失败 ({path.name}): {e} — 跳过本次存档, 训练继续", flush=True)
+            return False
 
     def save(self, path, metrics=None, kind="latest"):
         if not self.is_main:
@@ -607,12 +653,20 @@ class InLoopTrainer:
     # ── 主循环 ──────────────────────────────────────────────────────────
     def run(self):
         args = self.args
-        train_ds = InLoopDataset(args.data_dir, args.data_path, args.data_format,
-                                 policy=args.policy, max_samples=args.max_samples)
-        assert self.config.n_mem == train_ds.N, \
-            f"config n_mem={self.config.n_mem} != 特征 N={train_ds.N}"
-        val_ds = (InLoopDataset(args.val_data_dir, args.val_data_path,
-                                args.data_format, policy="tf")
+        train_ds, subs = build_inloop_dataset(
+            args.data_dir, args.data_path, args.data_format,
+            policy=args.policy, max_samples=args.max_samples)
+        for sub in subs:
+            if not sub.teacher_only_pool:
+                assert self.config.n_mem == sub.N, \
+                    f"config n_mem={self.config.n_mem} != 特征 N={sub.N} ({sub.data_dir})"
+            elif self.is_main:
+                print(f"Stage0 pool teacher-only 模式: 忽略 hm_pool={sub.pool_ns}, "
+                      f"在环按 config n_mem={self.config.n_mem} 重算逐层 HM")
+        val_ds = (build_inloop_dataset(
+                      args.val_data_dir, args.val_data_path,
+                      getattr(args, "val_data_format", None) or args.data_format,
+                      policy="tf")[0]
                   if args.val_data_dir else None)
         if self.world > 1:
             sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
