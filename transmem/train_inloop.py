@@ -44,7 +44,8 @@ import math
 import os
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 import torch
 import torch.distributed as dist
@@ -77,6 +78,10 @@ from transmem.gate_training import (
     validate_gate_training_options,
 )
 from transmem.train_offpolicy import seed_everything, setup_distributed
+from transmem.nvme_s3_checkpoint import (
+    add_nvme_s3_checkpoint_args,
+    build_nvme_s3_checkpoint_store,
+)
 
 
 def parse_args():
@@ -139,6 +144,7 @@ def parse_args():
     p.add_argument("--resume", default=None)
     p.add_argument("--seed", type=int, default=None,
                    help="显式固定 TransMem 初始化与数据顺序; 默认保持历史随机行为")
+    add_nvme_s3_checkpoint_args(p)
     return p.parse_args()
 
 
@@ -245,6 +251,11 @@ class InLoopTrainer:
             args.device = f"cuda:{local_rank}"
         self.device = torch.device(args.device)
         seed_everything(getattr(args, "seed", None))
+        self.checkpoint_store = build_nvme_s3_checkpoint_store(args)
+        if self.is_main and self.checkpoint_store is not None:
+            print(
+                "Checkpoint storage: NVMe staging -> "
+                f"{self.checkpoint_store.s3_uri}")
 
         # 冻结 LLM (测试可注入现成 model/tokenizer)
         if model is None:
@@ -288,8 +299,15 @@ class InLoopTrainer:
             load_legacy_gate_state(self.mem, checkpoint)
             self.parent_checkpoint = str(Path(init_checkpoint).expanduser().resolve())
             del checkpoint
-            migrated_path = Path(args.output_dir) / "migrated_init.pt"
+            migrated_path = (
+                self.checkpoint_store.local_path("migrated_init.pt")
+                if self.checkpoint_store is not None
+                else Path(args.output_dir) / "migrated_init.pt")
+            migration_published = False
             if self.is_main:
+                if self.checkpoint_store is not None:
+                    self.checkpoint_store.download(
+                        "migrated_init.pt", required=False)
                 materialize_migrated_gate_checkpoint(
                     self.mem,
                     migrated_path,
@@ -298,12 +316,23 @@ class InLoopTrainer:
                     joint_finetune_steps=joint_finetune_steps,
                     seed=getattr(args, "seed", None),
                 )
+                if self.checkpoint_store is not None:
+                    migration_published = self.checkpoint_store.upload_existing(
+                        migrated_path,
+                        name="migrated_init.pt",
+                        remove_local=False,
+                    )
             if self.world > 1:
                 dist.barrier()
             migrated = torch.load(
                 migrated_path, map_location="cpu", weights_only=False)
             self.mem.load_state_dict(migrated["model_state_dict"], strict=True)
             del migrated
+            if self.world > 1:
+                dist.barrier()
+            if (self.is_main and self.checkpoint_store is not None
+                    and migration_published):
+                self.checkpoint_store.remove_local(migrated_path)
             self._legacy_regression_pending = True
         if self.world > 1:
             for p in self.mem.parameters():
@@ -497,6 +526,11 @@ class InLoopTrainer:
             print(f"  ⚠️ 存档失败 ({path.name}): {e} — 跳过本次存档, 训练继续", flush=True)
             return False
 
+    def _save_checkpoint_payload(self, payload: object, path: str, name: str) -> bool:
+        if self.checkpoint_store is not None:
+            return self.checkpoint_store.save_payload(payload, name)
+        return self._atomic_torch_save(payload, Path(path) / name)
+
     def save(self, path, metrics=None, kind="latest"):
         if not self.is_main:
             return
@@ -514,26 +548,30 @@ class InLoopTrainer:
                     self, "resolved_joint_finetune_steps",
                     getattr(self.args, "joint_finetune_steps", None)),
                 "joint_phase_initialized": self.joint_phase_initialized}
+        if self.checkpoint_store is not None:
+            base["checkpoint_storage"] = self.checkpoint_store.metadata()
         if metrics:
             base["metrics"] = metrics
-        self._atomic_torch_save(
-            dict(base, optimizer_state_dict=self.optimizer.state_dict()),
-            Path(path) / "latest.pt")
-        names = ["latest.pt"]
+        names = []
+        if self._save_checkpoint_payload(
+                dict(base, optimizer_state_dict=self.optimizer.state_dict()),
+                path, "latest.pt"):
+            names.append("latest.pt")
         if kind in {"best", "best_and_gate"}:
-            self._atomic_torch_save(base, Path(path) / "best.pt")
-            names.append("best.pt(model-only)")
+            if self._save_checkpoint_payload(base, path, "best.pt"):
+                names.append("best.pt(model-only)")
         if kind in {"gate_best", "best_and_gate"}:
-            self._atomic_torch_save(base, Path(path) / "gate_only_best.pt")
-            names.append("gate_only_best.pt(model-only)")
+            if self._save_checkpoint_payload(base, path, "gate_only_best.pt"):
+                names.append("gate_only_best.pt(model-only)")
         if kind == "calibrated":
-            self._atomic_torch_save(base, Path(path) / "gate_only.pt")
-            names.append("gate_only.pt(model-only)")
+            if self._save_checkpoint_payload(base, path, "gate_only.pt"):
+                names.append("gate_only.pt(model-only)")
         elif kind == "final":
             fn = f"step_{self.global_step:07d}.pt"
-            self._atomic_torch_save(base, Path(path) / fn)
-            names.append(f"{fn}(model-only)")
-        print(f"  Checkpoint saved: {', '.join(names)} (step {self.global_step})")
+            if self._save_checkpoint_payload(base, path, fn):
+                names.append(f"{fn}(model-only)")
+        if names:
+            print(f"  Checkpoint saved: {', '.join(names)} (step {self.global_step})")
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
@@ -595,6 +633,9 @@ class InLoopTrainer:
         tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(r, indent=2, ensure_ascii=False))
         tmp.replace(p)
+        if self.checkpoint_store is not None:
+            self.checkpoint_store.upload_existing(
+                p, name="result.json", remove_local=False)
 
     def _start_joint_phase(self) -> None:
         """Reload A1's held-out best model and start A2 with fresh Adam state."""
@@ -604,16 +645,25 @@ class InLoopTrainer:
             dist.barrier()
         source_name = None
         if self.is_main:
-            output = Path(self.args.output_dir)
-            source = output / "gate_only_best.pt"
-            if not source.exists():
-                source = output / "gate_only.pt"
-            if not source.exists():
-                raise RuntimeError(
-                    "A2 启动失败: gate_only_best.pt 和 gate_only.pt 均不存在")
+            if self.checkpoint_store is not None:
+                source = self.checkpoint_store.download(
+                    "gate_only_best.pt", required=False)
+                if source is None:
+                    source = self.checkpoint_store.download(
+                        "gate_only.pt", required=True)
+            else:
+                output = Path(self.args.output_dir)
+                source = output / "gate_only_best.pt"
+                if not source.exists():
+                    source = output / "gate_only.pt"
+                if not source.exists():
+                    raise RuntimeError(
+                        "A2 启动失败: gate_only_best.pt 和 gate_only.pt 均不存在")
             checkpoint = torch.load(source, map_location="cpu", weights_only=False)
             self.mem.load_state_dict(checkpoint["model_state_dict"], strict=True)
             source_name = source.name
+            if self.checkpoint_store is not None:
+                self.checkpoint_store.remove_local(source)
         if self.world > 1:
             for parameter in self.mem.parameters():
                 dist.broadcast(parameter.data, src=0)
@@ -632,6 +682,33 @@ class InLoopTrainer:
             print(f"  A2 joint fine-tune 从 {source_name} 启动 (optimizer 已重置)")
         if self.world > 1:
             dist.barrier()
+
+    def resolve_resume_path(self, requested: str | None) -> str | None:
+        """Resolve local auto-resume or stage remote latest.pt on NVMe."""
+        if self.checkpoint_store is None:
+            if requested is not None:
+                return requested
+            auto = Path(self.args.output_dir) / "latest.pt"
+            return str(auto) if auto.exists() else None
+        if requested and not requested.startswith("s3://"):
+            return requested
+        remote = requested or self.checkpoint_store.remote_uri("latest.pt")
+        staged = self.checkpoint_store.local_path(
+            PurePosixPath(urlparse(remote).path).name)
+        if self.is_main:
+            self.checkpoint_store.download_uri(
+                remote, required=requested is not None)
+        if self.world > 1:
+            dist.barrier()
+        return str(staged) if staged.exists() else None
+
+    def release_resume_path(self, path: str | None) -> None:
+        if self.checkpoint_store is None or path is None:
+            return
+        if self.world > 1:
+            dist.barrier()
+        if self.is_main:
+            self.checkpoint_store.remove_local(path)
 
     def _set_lr(self, step, total_steps):
         warmup = self.args.warmup_steps
@@ -865,15 +942,13 @@ class InLoopTrainer:
 def main():
     args = parse_args()
     trainer = InLoopTrainer(args)
-    resume = args.resume
-    if resume is None:
-        auto = Path(args.output_dir) / "latest.pt"
-        if auto.exists():
-            resume = str(auto)
+    resume = trainer.resolve_resume_path(args.resume)
     if resume:
         try:
             trainer.load(resume)
         except RuntimeError as e:
+            if trainer.checkpoint_store is not None:
+                raise
             bad = str(Path(resume)) + ".corrupt"
             if trainer.is_main:
                 print(f"⚠️ resume 档损坏 ({e}); 挪到 {bad}, 从头训练")
@@ -883,6 +958,8 @@ def main():
                     pass
             trainer.global_step = 0
             trainer.epoch = 0
+        else:
+            trainer.release_resume_path(resume)
     trainer.run()
 
 

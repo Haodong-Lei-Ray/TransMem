@@ -38,7 +38,8 @@ import os
 import random
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 import torch
 import torch.distributed as dist
@@ -65,6 +66,10 @@ from transmem.gate_training import (
     set_gate_optimizer_lrs,
     validate_dynamic_resume_checkpoint,
     validate_gate_training_options,
+)
+from transmem.nvme_s3_checkpoint import (
+    add_nvme_s3_checkpoint_args,
+    build_nvme_s3_checkpoint_store,
 )
 
 _DTYPE = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
@@ -353,6 +358,7 @@ def parse_args():
     p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     p.add_argument("--resume", default=None)
     p.add_argument("--overfit_batch", action="store_true")
+    add_nvme_s3_checkpoint_args(p)
     args = p.parse_args()
     try:
         spec = ",".join(args.curve_steps or [])
@@ -548,6 +554,11 @@ class OffPolicyTrainer:
             args.device = f"cuda:{local_rank}"
         self.device = torch.device(args.device)
         self.train_dtype = _DTYPE[args.dtype]
+        self.checkpoint_store = build_nvme_s3_checkpoint_store(args)
+        if self.is_main and self.checkpoint_store is not None:
+            print(
+                "Checkpoint storage: NVMe staging -> "
+                f"{self.checkpoint_store.s3_uri}")
 
         # Seed before TransMem construction: fixed-seed curve reruns must share
         # model initialization, not merely the data order.
@@ -578,8 +589,15 @@ class OffPolicyTrainer:
             load_legacy_gate_state(self.mem, parent)
             self.parent_checkpoint = _normalize_path(args.init_checkpoint)
             del parent
-            migrated_path = Path(args.output_dir) / "migrated_init.pt"
+            migrated_path = (
+                self.checkpoint_store.local_path("migrated_init.pt")
+                if self.checkpoint_store is not None
+                else Path(args.output_dir) / "migrated_init.pt")
+            migration_published = False
             if self.is_main:
+                if self.checkpoint_store is not None:
+                    self.checkpoint_store.download(
+                        "migrated_init.pt", required=False)
                 materialize_migrated_gate_checkpoint(
                     self.mem,
                     migrated_path,
@@ -588,12 +606,23 @@ class OffPolicyTrainer:
                     joint_finetune_steps=args.joint_finetune_steps,
                     seed=getattr(args, "seed", None),
                 )
+                if self.checkpoint_store is not None:
+                    migration_published = self.checkpoint_store.upload_existing(
+                        migrated_path,
+                        name="migrated_init.pt",
+                        remove_local=False,
+                    )
             if self.world > 1:
                 dist.barrier()
             migrated = torch.load(
                 migrated_path, map_location="cpu", weights_only=False)
             self.mem.load_state_dict(migrated["model_state_dict"], strict=True)
             del migrated
+            if self.world > 1:
+                dist.barrier()
+            if (self.is_main and self.checkpoint_store is not None
+                    and migration_published):
+                self.checkpoint_store.remove_local(migrated_path)
             self._legacy_regression_pending = True
         elif self.config.warm_start:
             self._warm_start()
@@ -789,6 +818,15 @@ class OffPolicyTrainer:
                 break
         return {k: v / max(n, 1) for k, v in agg.items()}
 
+    def _save_checkpoint_payload(self, payload: object, path: str, name: str) -> bool:
+        if self.checkpoint_store is not None:
+            return self.checkpoint_store.save_payload(payload, name)
+        destination = Path(path) / name
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        torch.save(payload, temporary)
+        os.replace(temporary, destination)
+        return True
+
     def save(self, path, metrics=None, kind="latest"):
         """kind: latest=只覆写 latest.pt (周期性, 不累积占盘, 单 ckpt 4.6G);
         best=覆写 best.pt + latest.pt; final=额外落 step_XXXXXXX.pt 存档.
@@ -808,38 +846,44 @@ class OffPolicyTrainer:
                     self, "resolved_joint_finetune_steps",
                     self.args.joint_finetune_steps),
                 "joint_phase_initialized": self.joint_phase_initialized}
+        if self.checkpoint_store is not None:
+            base["checkpoint_storage"] = self.checkpoint_store.metadata()
         if metrics:
             base["metrics"] = metrics
         # latest.pt 带 optimizer (断点续训需要); best/final 只存 model_state_dict —
         # 评测/推理够用, 省盘 (8B TransMem 含 optimizer 12.6G, 只存 model 4.2G).
         # 原子写 (tmp + os.replace): spot 抢占砍在写档中途不会留截断 zip
         # (10218607 实测半截 latest.pt 让 requeue 断点重续全体崩).
-        def _asave(obj, p):
-            tmp = p.with_suffix(p.suffix + ".tmp")
-            torch.save(obj, tmp)
-            os.replace(tmp, p)
-        _asave(dict(base, optimizer_state_dict=self.optimizer.state_dict()),
-               Path(path) / "latest.pt")
-        names = ["latest.pt"]
+        names = []
+        if self._save_checkpoint_payload(
+                dict(base, optimizer_state_dict=self.optimizer.state_dict()),
+                path, "latest.pt"):
+            names.append("latest.pt")
         if kind in {"best", "best_and_gate"}:
-            _asave(base, Path(path) / "best.pt"); names.append("best.pt(model-only)")
+            if self._save_checkpoint_payload(base, path, "best.pt"):
+                names.append("best.pt(model-only)")
         if kind in {"gate_best", "best_and_gate"}:
-            _asave(base, Path(path) / "gate_only_best.pt")
-            names.append("gate_only_best.pt(model-only)")
+            if self._save_checkpoint_payload(base, path, "gate_only_best.pt"):
+                names.append("gate_only_best.pt(model-only)")
         if kind == "calibrated":
-            _asave(base, Path(path) / "gate_only.pt")
-            names.append("gate_only.pt(model-only)")
+            if self._save_checkpoint_payload(base, path, "gate_only.pt"):
+                names.append("gate_only.pt(model-only)")
         elif kind == "final":
             fn = f"step_{self.global_step:07d}.pt"
-            _asave(base, Path(path) / fn); names.append(f"{fn}(model-only)")
-        print(f"  Checkpoint saved: {', '.join(names)} (step {self.global_step})")
+            if self._save_checkpoint_payload(base, path, fn):
+                names.append(f"{fn}(model-only)")
+        if names:
+            print(f"  Checkpoint saved: {', '.join(names)} (step {self.global_step})")
 
     def _maybe_save_curve_checkpoint(self, curve_steps: set[int],
                                      schedule_total_steps: int) -> None:
         """Save exactly requested curve points without touching ``latest.pt``."""
         if not self.is_main or self.global_step not in curve_steps:
             return
-        path = curve_checkpoint_path(self.args.output_dir, self.global_step)
+        filename = f"curve_step_{int(self.global_step):07d}.pt"
+        path = (self.checkpoint_store.local_path(filename)
+                if self.checkpoint_store is not None
+                else curve_checkpoint_path(self.args.output_dir, self.global_step))
         save_curve_checkpoint(
             path,
             model=self.mem,
@@ -850,7 +894,35 @@ class OffPolicyTrainer:
             schedule_total_steps=schedule_total_steps,
             training_recipe=self.training_recipe,
         )
+        if (self.checkpoint_store is not None
+                and not self.checkpoint_store.upload_existing(
+                    path, name=filename, remove_local=True)):
+            return
         print(f"  Curve checkpoint saved: {path.name} (model-only)")
+
+    def resolve_resume_path(self, requested: str | None) -> str | None:
+        """Resolve an explicit/local resume or stage remote latest.pt on NVMe."""
+        if self.checkpoint_store is None:
+            return requested
+        if requested and not requested.startswith("s3://"):
+            return requested
+        remote = requested or self.checkpoint_store.remote_uri("latest.pt")
+        staged = self.checkpoint_store.local_path(
+            PurePosixPath(urlparse(remote).path).name)
+        if self.is_main:
+            self.checkpoint_store.download_uri(
+                remote, required=requested is not None)
+        if self.world > 1:
+            dist.barrier()
+        return str(staged) if staged.exists() else None
+
+    def release_resume_path(self, path: str | None) -> None:
+        if self.checkpoint_store is None or path is None:
+            return
+        if self.world > 1:
+            dist.barrier()
+        if self.is_main:
+            self.checkpoint_store.remove_local(path)
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
@@ -924,6 +996,9 @@ class OffPolicyTrainer:
         tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(r, indent=2, ensure_ascii=False))
         tmp.replace(p)   # 同目录 rename, 原子替换, 防止写一半的损坏文件
+        if self.checkpoint_store is not None:
+            self.checkpoint_store.upload_existing(
+                p, name="result.json", remove_local=False)
 
     def _start_joint_phase(self) -> None:
         """Reload A1's held-out best model and start A2 with fresh Adam state."""
@@ -933,16 +1008,25 @@ class OffPolicyTrainer:
             dist.barrier()
         source_name = None
         if self.is_main:
-            output = Path(self.args.output_dir)
-            source = output / "gate_only_best.pt"
-            if not source.exists():
-                source = output / "gate_only.pt"
-            if not source.exists():
-                raise RuntimeError(
-                    "A2 启动失败: gate_only_best.pt 和 gate_only.pt 均不存在")
+            if self.checkpoint_store is not None:
+                source = self.checkpoint_store.download(
+                    "gate_only_best.pt", required=False)
+                if source is None:
+                    source = self.checkpoint_store.download(
+                        "gate_only.pt", required=True)
+            else:
+                output = Path(self.args.output_dir)
+                source = output / "gate_only_best.pt"
+                if not source.exists():
+                    source = output / "gate_only.pt"
+                if not source.exists():
+                    raise RuntimeError(
+                        "A2 启动失败: gate_only_best.pt 和 gate_only.pt 均不存在")
             checkpoint = torch.load(source, map_location="cpu", weights_only=False)
             self.mem.load_state_dict(checkpoint["model_state_dict"], strict=True)
             source_name = source.name
+            if self.checkpoint_store is not None:
+                self.checkpoint_store.remove_local(source)
         if self.world > 1:
             for parameter in self.mem.parameters():
                 dist.broadcast(parameter.data, src=0)
@@ -1194,8 +1278,10 @@ class OffPolicyTrainer:
 def main():
     args = parse_args()
     trainer = OffPolicyTrainer(args)
-    if args.resume:
-        trainer.load(args.resume)
+    resume = trainer.resolve_resume_path(args.resume)
+    if resume:
+        trainer.load(resume)
+        trainer.release_resume_path(resume)
     trainer.run()
 
 
