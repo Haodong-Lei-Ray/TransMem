@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import subprocess
 from typing import Mapping
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import torch
 
@@ -84,6 +85,7 @@ class NvmeS3CheckpointStore:
         ).rstrip("/")
         self.endpoint_url = str(endpoint_url).rstrip("/")
         self._parse_s3_uri(self.s3_uri)
+        self.failed_uploads: set[str] = set()
 
     @staticmethod
     def _parse_s3_uri(uri: str) -> tuple[str, str]:
@@ -160,6 +162,27 @@ class NvmeS3CheckpointStore:
         raise RuntimeError(
             f"S3 head-object 失败 ({uri}): {message.strip()}")
 
+    def _remove_remote_best_effort(self, uri: str) -> None:
+        try:
+            self._run_aws([
+                "s3", "rm", uri, "--only-show-errors",
+            ], check=False)
+        except OSError:
+            pass
+
+    def _preserve_unpublished_local(self, path: Path) -> Path:
+        """Move a failed staged checkpoint aside so resume cannot overwrite it."""
+        preserved = path.with_name(
+            f"{path.stem}.unpublished-{uuid4().hex}{path.suffix}")
+        os.replace(path, preserved)
+        return preserved
+
+    @staticmethod
+    def _remove_superseded_unpublished(path: Path) -> None:
+        pattern = f"{path.stem}.unpublished-*{path.suffix}"
+        for candidate in path.parent.glob(pattern):
+            candidate.unlink(missing_ok=True)
+
     def upload_existing(
         self,
         local_path: str | Path,
@@ -171,18 +194,35 @@ class NvmeS3CheckpointStore:
         local = Path(local_path)
         object_name = self._safe_name(name or local.name)
         remote = self.remote_uri(object_name)
+        pending_name = self._safe_name(
+            f".pending/{PurePosixPath(object_name).name}.{uuid4().hex}.upload")
+        pending_remote = self.remote_uri(pending_name)
         try:
             local_size = local.stat().st_size
             self._run_aws([
-                "s3", "cp", str(local), remote,
+                "s3", "cp", str(local), pending_remote,
                 "--only-show-errors", "--checksum-algorithm", "SHA256",
+            ])
+            pending_size = self.remote_size(pending_remote)
+            if pending_size != local_size:
+                raise RuntimeError(
+                    "S3 临时对象字节校验失败: "
+                    f"local={local_size}, pending={pending_size}")
+            # S3→S3 cp performs a server-side (multipart for large objects)
+            # publication. The final key changes only after that copy completes,
+            # so a failed upload/copy cannot replace the previous checkpoint.
+            self._run_aws([
+                "s3", "cp", pending_remote, remote, "--only-show-errors",
             ])
             remote_size = self.remote_size(remote)
             if remote_size != local_size:
                 raise RuntimeError(
                     f"S3 字节校验失败: local={local_size}, remote={remote_size}")
+            self._remove_remote_best_effort(pending_remote)
+            self._remove_superseded_unpublished(local)
             if remove_local:
                 local.unlink(missing_ok=True)
+            self.failed_uploads.discard(object_name)
             print(
                 f"  NVMe→S3 checkpoint: {object_name} "
                 f"({local_size} bytes) -> {remote}",
@@ -190,16 +230,36 @@ class NvmeS3CheckpointStore:
             )
             return True
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            self.failed_uploads.add(object_name)
+            # The NVMe source remains the retry source, so a fully uploaded but
+            # unpublished 20 GiB pending object would only leak S3 capacity.
+            self._remove_remote_best_effort(pending_remote)
+            preserved = None
+            if remove_local and local.exists():
+                try:
+                    preserved = self._preserve_unpublished_local(local)
+                except OSError:
+                    preserved = local
             print(
                 f"  ⚠️ NVMe→S3 存档失败 ({object_name}): {exc}; "
-                "保留旧 S3 checkpoint 和当前 NVMe 文件",
+                "保留旧 S3 checkpoint 和当前文件"
+                + (f" {preserved}" if preserved is not None else ""),
                 flush=True,
             )
             return False
 
+    def assert_uploads_complete(self) -> None:
+        """Fail the process at the end if its latest upload attempt did not publish."""
+        if self.failed_uploads:
+            names = ", ".join(sorted(self.failed_uploads))
+            raise RuntimeError(
+                "训练已完成，但这些对象的最近一次 S3 上传失败；"
+                f"保留本地/NVMe 文件并以失败状态退出: {names}")
+
     def save_payload(self, payload: object, name: str) -> bool:
         """Serialize on NVMe and publish; no durable local checkpoint remains."""
-        target = self.local_path(name)
+        object_name = self._safe_name(name)
+        target = self.local_path(object_name)
         temporary = target.with_suffix(target.suffix + ".tmp")
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -208,20 +268,28 @@ class NvmeS3CheckpointStore:
             os.replace(temporary, target)
         except (OSError, RuntimeError) as exc:
             temporary.unlink(missing_ok=True)
+            self.failed_uploads.add(object_name)
             print(
                 f"  ⚠️ NVMe 序列化失败 ({target.name}): {exc}; 跳过本次存档",
                 flush=True,
             )
             return False
-        return self.upload_existing(target, name=name, remove_local=True)
+        return self.upload_existing(
+            target, name=object_name, remove_local=True)
 
     def download_uri(self, uri: str, *, required: bool = False) -> Path | None:
         """Download and size-verify one S3 checkpoint into the staging directory."""
         remote_size = self.remote_size(uri)
         name = PurePosixPath(urlparse(uri).path).name
         target = self.local_path(name)
+        if target.exists():
+            preserved = self._preserve_unpublished_local(target)
+            print(
+                "  保留 requeue 前尚未确认发布的 NVMe candidate: "
+                f"{preserved}",
+                flush=True,
+            )
         if remote_size is None:
-            target.unlink(missing_ok=True)
             if required:
                 raise FileNotFoundError(f"S3 checkpoint 不存在: {uri}")
             return None
@@ -229,7 +297,6 @@ class NvmeS3CheckpointStore:
         temporary = target.with_suffix(target.suffix + ".download")
         # Size equality is insufficient for a stale failed-upload file, so a
         # remote resume always replaces any existing NVMe candidate.
-        target.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
         try:
             self._run_aws([

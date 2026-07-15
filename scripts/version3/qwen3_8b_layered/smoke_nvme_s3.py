@@ -25,7 +25,9 @@ def main() -> None:
     )
     payload = {
         "global_step": 250,
-        "sentinel": torch.arange(4096, dtype=torch.int64),
+        # Exceed aws-cli's default multipart threshold so the real smoke also
+        # exercises multipart upload and server-side multipart publication.
+        "sentinel": torch.arange(2_000_000, dtype=torch.int64),
     }
 
     if not store.save_payload(payload, "latest.pt"):

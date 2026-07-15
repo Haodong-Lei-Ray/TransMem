@@ -845,7 +845,11 @@ class OffPolicyTrainer:
                 "joint_finetune_steps": getattr(
                     self, "resolved_joint_finetune_steps",
                     self.args.joint_finetune_steps),
-                "joint_phase_initialized": self.joint_phase_initialized}
+                "joint_phase_initialized": self.joint_phase_initialized,
+                "best_val": self.best_val,
+                "best_step": self.best_step,
+                "best_gate_val": self.best_gate_val,
+                "best_gate_step": self.best_gate_step}
         if self.checkpoint_store is not None:
             base["checkpoint_storage"] = self.checkpoint_store.metadata()
         if metrics:
@@ -953,12 +957,20 @@ class OffPolicyTrainer:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.global_step = ckpt.get("global_step", 0)
         self.epoch = ckpt.get("epoch", 0)
+        self.best_val = ckpt.get("best_val", self.best_val)
+        self.best_step = ckpt.get("best_step", self.best_step)
+        self.best_gate_val = ckpt.get("best_gate_val", self.best_gate_val)
+        self.best_gate_step = ckpt.get("best_gate_step", self.best_gate_step)
         self.joint_phase_initialized = bool(ckpt.get(
             "joint_phase_initialized",
             self.args.gate_calibration_steps == 0
             or self.global_step > self.args.gate_calibration_steps,
         ))
-        self._load_result()   # 恢复 best_val, 避免 resume 后覆盖历史最优
+        # New checkpoints carry best-state atomically with their model/step.
+        # Only legacy checkpoints need the independent result.json fallback;
+        # otherwise a stale local result could overwrite newer S3 state.
+        if "best_val" not in ckpt:
+            self._load_result()
         if self.is_main:
             if saved_recipe is None:
                 print("[WARN] legacy checkpoint has no training_recipe")
@@ -1283,6 +1295,8 @@ def main():
         trainer.load(resume)
         trainer.release_resume_path(resume)
     trainer.run()
+    if trainer.is_main and trainer.checkpoint_store is not None:
+        trainer.checkpoint_store.assert_uploads_complete()
 
 
 if __name__ == "__main__":

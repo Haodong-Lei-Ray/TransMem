@@ -50,21 +50,39 @@ JOB_ID=${SLURM_JOB_ID:-$(date +%s)_$$}
 MOUNT_POINT=/mnt/petrelfs/leihaodong/tmp/s3_inloop_8b_${JOB_ID}
 CACHE_DIR=/nvme/leihaodong/s3cache_inloop_8b_${JOB_ID}
 NVME_CKPT_DIR=${NVME_CKPT_DIR:-/nvme/leihaodong/Project4/checkpoints/$(basename "$OUTPUT_DIR")_${JOB_ID}}
-fusermount -u "$MOUNT_POINT" 2>/dev/null || true
-rm -rf "$MOUNT_POINT" "$CACHE_DIR" "$NVME_CKPT_DIR" 2>/dev/null || true
+if mountpoint -q "$MOUNT_POINT"; then
+  if ! fusermount -u "$MOUNT_POINT" 2>/dev/null \
+      && ! umount "$MOUNT_POINT" 2>/dev/null; then
+    echo "FATAL: 无法卸载已有 S3 挂载点 $MOUNT_POINT；拒绝清理或复用" >&2
+    exit 1
+  fi
+fi
+rmdir "$MOUNT_POINT" 2>/dev/null || true
+rm -rf "$CACHE_DIR"
 mkdir -p "$MOUNT_POINT" "$CACHE_DIR" "$NVME_CKPT_DIR"
 
 /mnt/petrelfs/leihaodong/app/s3mount datafrontier "$MOUNT_POINT" \
-  --cache "$CACHE_DIR" --allow-delete --allow-overwrite \
+  --cache "$CACHE_DIR" \
   --endpoint-url "$ENDPOINT" --force-path-style \
   --log-directory /mnt/petrelfs/leihaodong/s3mount_logs &
 S3PID=$!
 sleep 20
 
 cleanup() {
-  fusermount -u "$MOUNT_POINT" 2>/dev/null || umount "$MOUNT_POINT" 2>/dev/null || true
+  if mountpoint -q "$MOUNT_POINT"; then
+    fusermount -u "$MOUNT_POINT" 2>/dev/null \
+      || umount "$MOUNT_POINT" 2>/dev/null \
+      || echo "WARNING: S3 挂载点仍在，保留目录且绝不递归删除: $MOUNT_POINT" >&2
+  fi
   kill "$S3PID" 2>/dev/null || true
-  rm -rf "$MOUNT_POINT" "$CACHE_DIR" "$NVME_CKPT_DIR" || true
+  wait "$S3PID" 2>/dev/null || true
+  if ! mountpoint -q "$MOUNT_POINT"; then
+    rmdir "$MOUNT_POINT" 2>/dev/null || true
+  fi
+  rm -rf "$CACHE_DIR"
+  if ! rmdir "$NVME_CKPT_DIR" 2>/dev/null; then
+    echo "NVMe 中仍有未归档文件，保留供人工恢复: $NVME_CKPT_DIR" >&2
+  fi
 }
 trap cleanup EXIT
 
@@ -112,7 +130,8 @@ $UV run --python "$VENV/bin/python" python -m torch.distributed.run \
 if [[ "$SAVE_NVME_S3" = 1 ]]; then
   for f in latest.pt best.pt result.json; do
     if ! aws s3 ls "$S3_CKPT/$f" --endpoint-url "$ENDPOINT"; then
-      echo "WARNING: 训练完成但 S3 缺少 $S3_CKPT/$f" >&2
+      echo "FATAL: 训练完成但 S3 缺少 $S3_CKPT/$f" >&2
+      exit 1
     fi
   done
 else

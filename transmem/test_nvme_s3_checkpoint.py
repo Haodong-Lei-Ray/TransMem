@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import torch
+import pytest
 
 from transmem.nvme_s3_checkpoint import (
     NvmeS3CheckpointStore,
@@ -34,11 +35,17 @@ if args[:2] == ["s3", "cp"]:
     if destination.startswith("s3://") and os.environ.get("FAKE_AWS_FAIL_UPLOAD") == "1":
         print("injected upload failure", file=sys.stderr)
         raise SystemExit(9)
+    if (source.startswith("s3://") and destination.startswith("s3://")
+            and os.environ.get("FAKE_AWS_FAIL_PUBLISH") == "1"):
+        print("injected publish failure", file=sys.stderr)
+        raise SystemExit(8)
     source_path = s3_path(source) if source.startswith("s3://") else Path(source)
     destination_path = (s3_path(destination)
                         if destination.startswith("s3://") else Path(destination))
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source_path, destination_path)
+elif args[:2] == ["s3", "rm"]:
+    s3_path(args[2]).unlink(missing_ok=True)
 elif args[:2] == ["s3api", "head-object"]:
     bucket = args[args.index("--bucket") + 1]
     key = args[args.index("--key") + 1]
@@ -106,12 +113,48 @@ def test_failed_upload_keeps_previous_remote_resume_and_nvme_retry(
 
     monkeypatch.setenv("FAKE_AWS_FAIL_UPLOAD", "1")
     assert not store.save_payload({"global_step": 500}, "latest.pt")
-    assert store.local_path("latest.pt").exists()
+    preserved = list(store.local_dir.glob("latest.unpublished-*.pt"))
+    assert len(preserved) == 1
 
     monkeypatch.delenv("FAKE_AWS_FAIL_UPLOAD")
     staged = store.download("latest.pt", required=True)
     restored = torch.load(staged, map_location="cpu", weights_only=False)
     assert restored["global_step"] == 250
+    assert preserved[0].exists()
+
+
+def test_failed_atomic_publish_keeps_previous_remote_and_marks_run_failed(
+    tmp_path, monkeypatch,
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    assert store.save_payload({"global_step": 250}, "latest.pt")
+
+    monkeypatch.setenv("FAKE_AWS_FAIL_PUBLISH", "1")
+    assert not store.save_payload({"global_step": 500}, "latest.pt")
+    preserved = list(store.local_dir.glob("latest.unpublished-*.pt"))
+    assert len(preserved) == 1
+
+    monkeypatch.delenv("FAKE_AWS_FAIL_PUBLISH")
+    staged = store.download("latest.pt", required=True)
+    restored = torch.load(staged, map_location="cpu", weights_only=False)
+    assert restored["global_step"] == 250
+    assert preserved[0].exists()
+    assert not list((tmp_path / "fake-s3").rglob("*.upload"))
+    with pytest.raises(RuntimeError, match="latest.pt"):
+        store.assert_uploads_complete()
+
+
+def test_nvme_serialization_failure_marks_run_failed(tmp_path, monkeypatch) -> None:
+    store = _store(tmp_path, monkeypatch)
+
+    def fail_save(*_args, **_kwargs):
+        raise RuntimeError("injected NVMe write failure")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+    assert not store.save_payload({"global_step": 500}, "latest.pt")
+    assert not store.local_path("latest.pt").exists()
+    with pytest.raises(RuntimeError, match="latest.pt"):
+        store.assert_uploads_complete()
 
 
 def test_optional_missing_remote_does_not_start_from_stale_nvme(
@@ -124,3 +167,6 @@ def test_optional_missing_remote_does_not_start_from_stale_nvme(
 
     assert store.download("latest.pt", required=False) is None
     assert not stale.exists()
+    preserved = list(store.local_dir.glob("latest.unpublished-*.pt"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == b"stale"
