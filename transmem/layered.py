@@ -309,7 +309,14 @@ class LayeredRollout:
     @torch.no_grad()
     def generate_from_ids(self, cq_ids: torch.Tensor, len_cl: int, max_new: int,
                           sample: bool = False, temperature: float = 1.0,
-                          collect_gate_diagnostics: bool = False) -> list[int]:
+                          collect_gate_diagnostics: bool = False,
+                          return_log_probs: bool = False):
+        """Generate answer ids, optionally returning behavior-policy log-probs.
+
+        The default remains the historical ``list[int]`` return.  GRPO opts in
+        to ``(ids, log_probs)`` so importance ratios use exactly the tempered
+        distribution that sampled each token.
+        """
         from transformers.cache_utils import DynamicCache
         from .extract_features import hm_positions
 
@@ -357,6 +364,7 @@ class LayeredRollout:
         handles = [self.model.model.layers[l].register_forward_hook(mk_hook(l))
                    for l in self.layered.inject_layers]
         ans_ids: list[int] = []
+        chosen_log_probs: list[torch.Tensor] = []
         try:
             # base-model 调用: 不算全长 logits (122k 上下文时 CausalLM 全长 logits ~37GB);
             # last_hidden_state 已过 final_norm 且含末层 hook 偏置 → 手动过 lm_head.
@@ -370,10 +378,21 @@ class LayeredRollout:
             phase["mode"] = "decode"
             for token_index in range(max_new):
                 if sample:
-                    probs = torch.softmax(logits.float() / max(temperature, 1e-6), dim=-1)
+                    scaled_logits = logits.float() / max(temperature, 1e-6)
+                    if return_log_probs:
+                        log_distribution = torch.log_softmax(scaled_logits, dim=-1)
+                        probs = log_distribution.exp()
+                    else:
+                        probs = torch.softmax(scaled_logits, dim=-1)
                     nxt = torch.multinomial(probs, 1)[0]
                 else:
                     nxt = logits.argmax(dim=-1)
+                    if return_log_probs:
+                        scaled_logits = logits.float() / max(temperature, 1e-6)
+                        log_distribution = torch.log_softmax(scaled_logits, dim=-1)
+                if return_log_probs:
+                    chosen_log_probs.append(
+                        log_distribution.gather(-1, nxt.view(-1, 1)).squeeze())
                 tok_id = int(nxt.item())
                 ans_ids.append(tok_id)
                 if tok_id in self.eos_ids or token_index + 1 >= max_new:
@@ -387,6 +406,11 @@ class LayeredRollout:
                 hd.remove()
         self.last_gate_trace = ({"token_ids": list(ans_ids), "layers": trace}
                                 if trace is not None else None)
+        if return_log_probs:
+            values = (torch.stack(chosen_log_probs)
+                      if chosen_log_probs else torch.empty(
+                          0, device=cq_ids.device, dtype=torch.float32))
+            return ans_ids, values
         return ans_ids
 
     # ── 在环教师强制前向 (v3.2 训练用, 梯度可通; 无 no_grad) ─────────────

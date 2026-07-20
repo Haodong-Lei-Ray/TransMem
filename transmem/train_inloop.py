@@ -115,7 +115,7 @@ def parse_args():
     p.add_argument("--gate_calibration_steps", type=int, default=0)
     p.add_argument("--joint_finetune_steps", type=int, default=None)
     # 目标
-    p.add_argument("--policy", default="tf", choices=["tf", "onpolicy"])
+    p.add_argument("--policy", default="tf", choices=["tf", "onpolicy", "grpo"])
     p.add_argument("--divergence", default="forward_kl",
                    choices=["forward_kl", "reverse_kl", "jsd"])
     p.add_argument("--temperature", type=float, default=1.0)
@@ -124,6 +124,25 @@ def parse_args():
                    help="onpolicy rollout 采样温度; 0=贪心")
     p.add_argument("--max_answer_tokens", type=int, default=200,
                    help="onpolicy rollout 生成上限")
+    # GRPO-only flags are accepted here so train_grpo can reuse the complete
+    # model/data/storage CLI without maintaining a drifting duplicate parser.
+    p.add_argument("--reference_checkpoint", default=None)
+    p.add_argument(
+        "--reference_id", default=None,
+        help=("GRPO reference 的稳定身份（推荐 S3 URI）；保存进 checkpoint，"
+              "用于防止 auto-resume 混入另一条 reference 实验"),
+    )
+    p.add_argument("--group_size", type=int, default=4)
+    p.add_argument(
+        "--grpo_epochs", type=int, default=2,
+        help="每批 rollout 重用的 policy 更新轮数；>=2 时 clipping 才真正生效",
+    )
+    p.add_argument("--clip_eps", type=float, default=0.2)
+    p.add_argument("--reference_kl_beta", type=float, default=0.02)
+    p.add_argument("--reward_em_weight", type=float, default=0.25)
+    p.add_argument("--reward_verbosity_weight", type=float, default=0.05)
+    p.add_argument("--reward_verbosity_start", type=int, default=32)
+    p.add_argument("--reward_verbosity_cap", type=int, default=64)
     # 训练
     p.add_argument("--output_dir", default="checkpoints/inloop")
     p.add_argument("--grad_accum", type=int, default=4, help="每 rank 微步数/优化步")
@@ -142,6 +161,16 @@ def parse_args():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--resume", default=None)
+    p.add_argument(
+        "--warm_start_checkpoint",
+        default=None,
+        help=("只加载兼容 checkpoint 的 TransMem 权重，并将 optimizer、step、"
+              "best 指标全部重置；用于从 TF checkpoint 开始独立 OPD/RL 阶段"),
+    )
+    p.add_argument(
+        "--warm_start_id", default=None,
+        help="warm-start 父模型的稳定身份（如 S3 URI），用于 checkpoint provenance",
+    )
     p.add_argument("--seed", type=int, default=None,
                    help="显式固定 TransMem 初始化与数据顺序; 默认保持历史随机行为")
     add_nvme_s3_checkpoint_args(p)
@@ -354,6 +383,7 @@ class InLoopTrainer:
         self.best_step = -1
         self.best_gate_val = float("inf")
         self.best_gate_step = -1
+        self.warm_start_checkpoint = None
         self.joint_phase_initialized = not (
             init_scheme == "legacy_gate" and gate_calibration_steps > 0)
         self.writer = (SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
@@ -542,6 +572,7 @@ class InLoopTrainer:
                 "seed": getattr(self.args, "seed", None),
                 "init_scheme": getattr(self.args, "init_scheme", "scratch_joint"),
                 "parent_checkpoint": self.parent_checkpoint,
+                "warm_start_checkpoint": self.warm_start_checkpoint,
                 "gate_calibration_steps": getattr(
                     self.args, "gate_calibration_steps", 0),
                 "joint_finetune_steps": getattr(
@@ -552,6 +583,7 @@ class InLoopTrainer:
                 "best_step": self.best_step,
                 "best_gate_val": self.best_gate_val,
                 "best_gate_step": self.best_gate_step}
+        base.update(self.checkpoint_metadata())
         if self.checkpoint_store is not None:
             base["checkpoint_storage"] = self.checkpoint_store.metadata()
         if metrics:
@@ -579,6 +611,12 @@ class InLoopTrainer:
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        expected_mode = f"inloop_{self.args.policy}"
+        checkpoint_mode = ckpt.get("train_mode")
+        if checkpoint_mode is not None and checkpoint_mode != expected_mode:
+            raise ValueError(
+                "resume checkpoint train_mode 不匹配: "
+                f"checkpoint={checkpoint_mode}, expected={expected_mode}")
         validate_dynamic_resume_checkpoint(
             ckpt,
             config=self.config.to_dict(),
@@ -590,6 +628,7 @@ class InLoopTrainer:
                 self.args, "joint_finetune_steps", None),
             seed=getattr(self.args, "seed", None),
         )
+        self.validate_checkpoint_metadata(ckpt)
         self.mem.load_state_dict(ckpt["model_state_dict"], strict=True)
         self._legacy_regression_pending = False
         if "optimizer_state_dict" in ckpt:
@@ -605,6 +644,15 @@ class InLoopTrainer:
             "joint_phase_initialized",
             calibration_steps == 0 or self.global_step > calibration_steps,
         ))
+        checkpoint_warm_start = ckpt.get("warm_start_checkpoint")
+        expected_warm_start = getattr(self.args, "warm_start_id", None)
+        if (expected_warm_start is not None
+                and checkpoint_warm_start != expected_warm_start):
+            raise ValueError(
+                "resume checkpoint warm-start provenance 不匹配: "
+                f"checkpoint={checkpoint_warm_start!r}, "
+                f"expected={expected_warm_start!r}")
+        self.warm_start_checkpoint = checkpoint_warm_start
         # New checkpoints carry best-state atomically with their model/step.
         # Only legacy checkpoints need the independent result.json fallback;
         # otherwise a stale local result could overwrite newer S3 state.
@@ -612,6 +660,44 @@ class InLoopTrainer:
             self._load_result()
         if self.is_main:
             print(f"Resumed: step={self.global_step}, best_val={self.best_val:.6f}")
+
+    def warm_start(self, path: str) -> None:
+        """Load model weights only; start a new optimizer/schedule provenance."""
+        checkpoint_path = Path(path).expanduser().resolve()
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_config = checkpoint.get("config")
+        current_config = self.config.to_dict()
+        if checkpoint_config != current_config:
+            raise ValueError(
+                "warm-start checkpoint config 与当前 TransMem 拓扑不一致")
+        self.mem.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        del checkpoint
+        self.optimizer.state.clear()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.global_step = 0
+        self.epoch = 0
+        self.best_val = float("inf")
+        self.best_step = -1
+        self.best_gate_val = float("inf")
+        self.best_gate_step = -1
+        self.warm_start_checkpoint = (
+            getattr(self.args, "warm_start_id", None) or str(checkpoint_path))
+        self._legacy_regression_pending = False
+        self.joint_phase_initialized = True
+        if self.world > 1:
+            for parameter in self.mem.parameters():
+                dist.broadcast(parameter.data, src=0)
+        if self.is_main:
+            print("Warm-started TransMem model-only: "
+                  f"{self.warm_start_checkpoint}; optimizer/step/best reset")
+
+    def checkpoint_metadata(self) -> dict:
+        """Subclass-owned resume provenance saved atomically with each checkpoint."""
+        return {}
+
+    def validate_checkpoint_metadata(self, _checkpoint: dict) -> None:
+        """Hook for stricter objective-specific auto-resume checks."""
 
     def _result_path(self):
         return Path(self.args.output_dir) / "result.json"
@@ -953,6 +1039,8 @@ class InLoopTrainer:
 
 def main():
     args = parse_args()
+    if args.resume and args.warm_start_checkpoint:
+        raise ValueError("--resume 与 --warm_start_checkpoint 不能同时显式提供")
     trainer = InLoopTrainer(args)
     resume = trainer.resolve_resume_path(args.resume)
     if resume:
@@ -972,6 +1060,8 @@ def main():
             trainer.epoch = 0
         else:
             trainer.release_resume_path(resume)
+    elif args.warm_start_checkpoint:
+        trainer.warm_start(args.warm_start_checkpoint)
     trainer.run()
     if trainer.is_main and trainer.checkpoint_store is not None:
         trainer.checkpoint_store.assert_uploads_complete()
