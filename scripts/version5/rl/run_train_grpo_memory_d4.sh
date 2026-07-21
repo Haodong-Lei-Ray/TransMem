@@ -144,7 +144,8 @@ cd "$PROJ"
   --policy grpo --divergence forward_kl \
   --thinking --require_answer_marker --require_thinking \
   --reward_scorer "$REWARD_SCORER" \
-  "${category_args[@]}" "${prompt_budget_args[@]}" \
+  ${category_args[@]+"${category_args[@]}"} \
+  ${prompt_budget_args[@]+"${prompt_budget_args[@]}"} \
   --sample_temp 0.7 --max_answer_tokens "$MAX_RESPONSE_TOKENS" \
   "${init_args[@]}" \
   --reference_checkpoint "$PARENT_LOCAL" --reference_id "$REFERENCE_ID" \
