@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -136,6 +137,7 @@ class GRPOTrainer(InLoopTrainer):
             print(f"Fixed GRPO reference: {self.reference_checkpoint}")
 
     @staticmethod
+    @contextmanager
     def _answer_log_probs(
         rollout: LayeredRollout,
         model,
@@ -146,13 +148,13 @@ class GRPOTrainer(InLoopTrainer):
         len_cq: int,
         temperature: float,
     ) -> torch.Tensor:
-        hidden = rollout.teacher_forced_forward(
-            full_ids, len_cl, len_cq, len(answer_ids))
-        logits = model.lm_head(hidden).float() / temperature
-        targets = torch.tensor(
-            answer_ids, device=logits.device, dtype=torch.long)
-        return torch.log_softmax(logits, dim=-1).gather(
-            -1, targets.unsqueeze(-1)).squeeze(-1)
+        with rollout.teacher_forced_backward_context(
+                full_ids, len_cl, len_cq, len(answer_ids)) as hidden:
+            logits = model.lm_head(hidden).float() / temperature
+            targets = torch.tensor(
+                answer_ids, device=logits.device, dtype=torch.long)
+            yield torch.log_softmax(logits, dim=-1).gather(
+                -1, targets.unsqueeze(-1)).squeeze(-1)
 
     def collect_group(self, item: dict) -> dict:
         """Sample one fixed behavior group and cache immutable reference scores."""
@@ -212,14 +214,15 @@ class GRPOTrainer(InLoopTrainer):
                 [answer_ids[:-1]], device=self.device, dtype=cq_ids.dtype)
             full_ids = torch.cat([cq_ids, prefix], dim=1) if length > 1 else cq_ids
             with torch.no_grad():
-                reference_log_probs = self._answer_log_probs(
-                    self.reference_rollout, self.model, full_ids, answer_ids,
-                    len_cl=len_cl, len_cq=len_cq,
-                    temperature=self.args.sample_temp)
+                with self._answer_log_probs(
+                        self.reference_rollout, self.model, full_ids, answer_ids,
+                        len_cl=len_cl, len_cq=len_cq,
+                        temperature=self.args.sample_temp) as reference_log_probs:
+                    reference_log_probs = reference_log_probs.detach().cpu()
             candidates.append({
                 "answer_ids": answer_ids,
                 "old_log_probs": old_log_probs.detach().cpu(),
-                "reference_log_probs": reference_log_probs.detach().cpu(),
+                "reference_log_probs": reference_log_probs,
                 "reward": reward,
                 "raw_prediction": raw_prediction,
                 "thinking": parsed.thinking,
@@ -273,21 +276,21 @@ class GRPOTrainer(InLoopTrainer):
             prefix = torch.tensor(
                 [answer_ids[:-1]], device=self.device, dtype=cq_ids.dtype)
             full_ids = torch.cat([cq_ids, prefix], dim=1) if length > 1 else cq_ids
-            policy_log_probs = self._answer_log_probs(
-                self.rollout, self.model, full_ids, answer_ids,
-                len_cl=len_cl, len_cq=len_cq,
-                temperature=self.args.sample_temp)
-            valid = torch.ones(
-                1, length, device=self.device, dtype=torch.bool)
-            policy_loss = grpo_clipped_loss(
-                policy_log_probs.unsqueeze(0), old_log_probs.unsqueeze(0),
-                advantages[index:index + 1], valid,
-                clip_eps=self.args.clip_eps)
-            reference_kl = sampled_reference_kl(
-                policy_log_probs, reference_log_probs)
-            candidate_loss = (
-                policy_loss + self.args.reference_kl_beta * reference_kl)
-            (candidate_loss * loss_scale / self.args.group_size).backward()
+            with self._answer_log_probs(
+                    self.rollout, self.model, full_ids, answer_ids,
+                    len_cl=len_cl, len_cq=len_cq,
+                    temperature=self.args.sample_temp) as policy_log_probs:
+                valid = torch.ones(
+                    1, length, device=self.device, dtype=torch.bool)
+                policy_loss = grpo_clipped_loss(
+                    policy_log_probs.unsqueeze(0), old_log_probs.unsqueeze(0),
+                    advantages[index:index + 1], valid,
+                    clip_eps=self.args.clip_eps)
+                reference_kl = sampled_reference_kl(
+                    policy_log_probs, reference_log_probs)
+                candidate_loss = (
+                    policy_loss + self.args.reference_kl_beta * reference_kl)
+                (candidate_loss * loss_scale / self.args.group_size).backward()
             policy_total += float(policy_loss.detach())
             kl_total += float(reference_kl.detach())
             loss_total += float(candidate_loss.detach())

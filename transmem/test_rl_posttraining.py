@@ -283,6 +283,54 @@ def test_grpo_group_backward_updates_only_transmem() -> None:
         assert payload["grpo_epochs"] == 2
 
 
+def test_layered_backward_keeps_hooks_during_hf_gradient_recompute() -> None:
+    """Regression for GRPO's delayed non-reentrant checkpoint recompute.
+
+    Hugging Face decoder layers are recomputed only when ``backward`` runs.
+    The layered policy therefore has to keep its injection hooks installed
+    until that recomputation is complete, not merely until model.forward
+    returns.
+    """
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    from transmem.layered import LayeredConfig, LayeredRollout, TransMemLayered
+
+    model = Qwen3ForCausalLM(Qwen3Config(
+        vocab_size=67,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+    ))
+    model.requires_grad_(False)
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.train()
+    mem = TransMemLayered(LayeredConfig(
+        dim=32,
+        block_depth=1,
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        intermediate_size=64,
+        max_position_embeddings=64,
+        n_mem=2,
+        max_queries=16,
+        inject_layers=[1],
+    ))
+    rollout = LayeredRollout(model, _FakeTok(), torch.device("cpu"), mem,
+                             dtype=torch.float32)
+    full_ids = torch.randint(0, 67, (1, 14))
+    with rollout.teacher_forced_backward_context(
+            full_ids, len_cl=8, len_cq=12, M=3) as hidden:
+        loss = model.lm_head(hidden).float().square().mean()
+        loss.backward()
+    assert any(parameter.grad is not None for parameter in mem.parameters())
+
+
 if __name__ == "__main__":
     test_hotpot_reward_matches_official_examples()
     test_thinking_is_excluded_from_answer_only_reward()

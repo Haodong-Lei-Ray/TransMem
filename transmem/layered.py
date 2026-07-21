@@ -25,6 +25,7 @@ ckpt config 带 "layered": true, evaluate.py 以此自动分发.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -429,6 +430,42 @@ class LayeredRollout:
                                len_cq: int, M: int,
                                return_proposals: bool = False,
                                force_gate_one: bool = False):
+        """Run teacher forcing with hooks scoped to the forward call.
+
+        Callers using Hugging Face gradient checkpointing must instead use
+        :meth:`teacher_forced_backward_context`, because decoder-layer
+        recomputation happens later during ``backward``.
+        """
+        result, handles = self._teacher_forced_forward_with_handles(
+            full_ids, len_cl, len_cq, M,
+            return_proposals=return_proposals,
+            force_gate_one=force_gate_one)
+        try:
+            return result
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    @contextmanager
+    def teacher_forced_backward_context(
+        self, full_ids: torch.Tensor, len_cl: int, len_cq: int, M: int,
+        return_proposals: bool = False, force_gate_one: bool = False,
+    ):
+        """Keep injection hooks alive through loss construction and backward."""
+        result, handles = self._teacher_forced_forward_with_handles(
+            full_ids, len_cl, len_cq, M,
+            return_proposals=return_proposals,
+            force_gate_one=force_gate_one)
+        try:
+            yield result
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    def _teacher_forced_forward_with_handles(
+        self, full_ids: torch.Tensor, len_cl: int, len_cq: int, M: int,
+        return_proposals: bool = False, force_gate_one: bool = False,
+    ):
         """full_ids = [CQ ; A_1..M-1] (与 stage0 student_forward 同构) 的单次并行前向,
         注入位 = M 个答案生成位 qpos = len_cq-1 .. len_cq+M-2 (prefill 末位 + 之后每个
         decode 位), 与 generate_from_ids 的注入集合逐位一致; LLM 因果注意力 + 块内
@@ -480,20 +517,24 @@ class LayeredRollout:
             out = self.model.model(input_ids=full_ids,
                                    attention_mask=torch.ones_like(full_ids),
                                    use_cache=False)
-        finally:
-            for hd in handles:
-                hd.remove()
-        h_q = out.last_hidden_state[0, qpos, :]                     # [M, dim] post-norm
-        if not return_proposals:
-            return h_q
-        missing = set(self.layered.inject_layers) - set(captured)
-        if missing:
-            raise RuntimeError(f"teacher-forced hooks 未捕获层: {sorted(missing)}")
-        ordered = [captured[layer] for layer in self.layered.inject_layers]
-        return h_q, LayeredOutput(
-            ms=torch.stack([proposal.ms for proposal in ordered], dim=1),
-            gate=torch.stack([proposal.gate for proposal in ordered], dim=1),
-        )
+            h_q = out.last_hidden_state[0, qpos, :]                 # [M, dim] post-norm
+            if not return_proposals:
+                result = h_q
+            else:
+                missing = set(self.layered.inject_layers) - set(captured)
+                if missing:
+                    raise RuntimeError(
+                        f"teacher-forced hooks 未捕获层: {sorted(missing)}")
+                ordered = [captured[layer] for layer in self.layered.inject_layers]
+                result = h_q, LayeredOutput(
+                    ms=torch.stack([proposal.ms for proposal in ordered], dim=1),
+                    gate=torch.stack([proposal.gate for proposal in ordered], dim=1),
+                )
+            return result, handles
+        except BaseException:
+            for handle in handles:
+                handle.remove()
+            raise
 
     # ── evaluate.py 接口 (与 OnPolicyRollout.student_rollout 同签名) ────
     @torch.no_grad()
