@@ -38,6 +38,7 @@ for p in (_PROJ4, _DELTA):
         sys.path.insert(0, p)
 
 from transmem.evaluate import Evaluator  # noqa: E402
+from transmem.rl import split_thinking_answer  # noqa: E402
 from deltamem.eval.locomo_protocol import (  # noqa: E402
     CATEGORY_NAMES,
     OFFICIAL_CONV_START_PROMPT,
@@ -68,6 +69,7 @@ def parse_args():
     p.add_argument("--config", default="transmem/config.json")
     p.add_argument("--N", type=int, default=4)
     p.add_argument("--max_answer_tokens", type=int, default=50)  # LoCoMo 官方 50
+    p.add_argument("--max_prompt_tokens", type=int, default=None)
     p.add_argument("--categories", type=int, nargs="+", default=[1, 2, 3, 4])
     p.add_argument("--max_questions", type=int, default=None, help="总题数上限 (冒烟)")
     p.add_argument("--device", default="cuda:0")
@@ -77,6 +79,16 @@ def parse_args():
     p.add_argument("--output_json", required=True)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--print_examples", type=int, default=3)
+    p.add_argument("--num_shards", type=int, default=1,
+                   help="将完整问题列表轮转切成多少份，默认 1 保持原行为")
+    p.add_argument("--shard_index", type=int, default=0,
+                   help="当前进程负责的分片编号，范围 [0, num_shards)")
+    p.add_argument("--gate_diagnostics", default=None,
+                   help="transmem 模式: 逐题收集 gate trace, 汇总写入该 json 路径")
+    p.add_argument("--thinking", action="store_true",
+                   help="思考模式 (经 SimpleNamespace 透传给 Evaluator): hybrid 模型走 "
+                        "enable_thinking, 纯 instruct 走 prompt hack; 输出按 </think> "
+                        "或 'Answer:' 切分, thinking 与 answer 分开保存")
     return p.parse_args()
 
 
@@ -159,15 +171,23 @@ def load_progress(path: Path) -> dict:
 
 def main():
     args = parse_args()
+    if args.num_shards < 1:
+        raise ValueError("--num_shards 必须 >= 1")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard_index 必须位于 [0, num_shards)")
     ev_args = types.SimpleNamespace(**vars(args))  # Evaluator 只取其中同名字段
     evaluator = Evaluator(ev_args)
 
     records = build_records(
         args.data_file, evaluator.tok, args.categories, args.max_questions, args.seed)
+    if args.num_shards > 1:
+        records = records[args.shard_index::args.num_shards]
     n_no_ev = sum(1 for r in records if not r["cs_text"])
     print(f"题数: {len(records)} (categories={args.categories}); "
           f"无 evidence: {n_no_ev}" + (" [teacher 模式下这些题预测为空]"
                                        if args.mode == "teacher" else ""))
+    if args.num_shards > 1:
+        print(f"分片: {args.shard_index + 1}/{args.num_shards}")
 
     out_path = Path(args.output_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,18 +197,27 @@ def main():
         print(f"断点续跑: 已有 {len(done)} 题, 跳过")
 
     examples = []
+    gate_traces = []
     with open(prog_path, "a") as prog_f:
         for rec in tqdm(records, desc=f"locomo[{args.mode}]", unit="q"):
             if rec["key"] in done:
                 continue
             # teacher 且无 evidence 时 Evaluator.predict 自己返回 ""
             raw = evaluator.predict(rec) or ""
-            canonical = canonicalize_locomo_prediction(raw, rec["spec"])
+            if args.gate_diagnostics and getattr(evaluator, "_last_gate_trace", None):
+                gate_traces.append({"key": rec["key"], "category": rec["category"],
+                                    **evaluator._last_gate_trace})
+            parsed = split_thinking_answer(raw)
+            canonical = canonicalize_locomo_prediction(parsed.answer, rec["spec"])
             f1 = score_locomo_prediction(rec["qa"], canonical)
             row = {"key": rec["key"], "category": rec["category"],
                    "question": rec["qa"]["question"],
                    "answer": rec["ground_truth"],
-                   "raw_prediction": raw, "prediction": canonical,
+                   "raw_prediction": raw, "thinking": parsed.thinking,
+                   "has_answer_marker": parsed.has_answer_marker,
+                   "format_valid": bool(
+                       parsed.has_answer_marker and parsed.thinking.strip()),
+                   "prediction": canonical,
                    "score": round(float(f1), 6)}
             prog_f.write(json.dumps(row, ensure_ascii=False) + "\n")
             prog_f.flush()
@@ -208,8 +237,13 @@ def main():
     summary = {
         "mode": args.mode, "ckpt": args.ckpt, "model_path": args.model_path,
         "decode": "greedy", "prompt_format": "transmem_chat",
+        "thinking": bool(getattr(args, "thinking", False)),
         "categories": args.categories, "num_questions": total,
+        "num_shards": args.num_shards, "shard_index": args.shard_index,
         "overall_f1": round(overall, 4),
+        "format_valid_rate": (
+            sum(bool(row.get("format_valid")) for row in rows)
+            / max(total, 1)),
         "category_f1": {
             str(c): {"name": CATEGORY_NAMES.get(c, "unknown"),
                      "score": round(cat_scores[c] / cat_counts[c], 4),
@@ -232,6 +266,16 @@ def main():
               f"pred={row['prediction'][:80]!r}  f1={row['score']:.3f}")
     print("=" * 72)
     print(f"结果: {out_path}")
+
+    if args.gate_diagnostics:
+        from transmem.evaluate import summarize_gate_traces
+        diag_path = Path(args.gate_diagnostics)
+        diag_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(diag_path, "w") as f:
+            json.dump({"num_traces": len(gate_traces),
+                       "summary": summarize_gate_traces(gate_traces),
+                       "samples": gate_traces}, f, ensure_ascii=False)
+        print(f"gate diagnostics -> {diag_path} ({len(gate_traces)} traces)")
 
 
 if __name__ == "__main__":

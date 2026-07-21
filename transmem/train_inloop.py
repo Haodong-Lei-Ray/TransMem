@@ -42,6 +42,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path, PurePosixPath
@@ -96,6 +97,14 @@ def parse_args():
                    help="val 数据格式 (可逗号分隔; 缺省用 --data_format)")
     p.add_argument("--val_max", type=int, default=128, help="每次 val 的样本上限")
     p.add_argument("--max_samples", type=int, default=None, help="训练集截断 (调试)")
+    p.add_argument(
+        "--data_fractions",
+        default=None,
+        help=("各训练源保留比例，逗号分隔并与 --data_dir 一一对应；例如 "
+              "0.15,1,1。每个受限源按 --data_sample_seed 做固定随机抽样"),
+    )
+    p.add_argument("--data_sample_seed", type=int, default=42,
+                   help="--data_fractions 固定随机子集的种子")
     # 模型/架构
     p.add_argument("--model_path", required=True)
     p.add_argument("--attn_impl", default="sdpa")
@@ -108,6 +117,12 @@ def parse_args():
         help="注入窗口的独占上界; S=32,D=4 表示层 28..31（默认取 LLM 总层数）",
     )
     p.add_argument("--inject_layers", default=None, help="显式层号, 逗号分隔 (0-based)")
+    p.add_argument(
+        "--transmem_before",
+        action="store_true",
+        help=("消融：TransMem 从本层 LLM block 的输入 H^(l-1) 读取 HM/HQ，"
+              "纠正量仍加到本层输出 H^l；缺省保持原来的 post-block 特征源"),
+    )
     p.add_argument("--init_scheme", default="scratch_joint",
                    choices=["legacy_gate", "scratch_joint"])
     p.add_argument("--init_checkpoint", default=None,
@@ -124,6 +139,11 @@ def parse_args():
                    help="onpolicy rollout 采样温度; 0=贪心")
     p.add_argument("--max_answer_tokens", type=int, default=200,
                    help="onpolicy rollout 生成上限")
+    p.add_argument(
+        "--max_prompt_tokens", type=int, default=None,
+        help=("可选的完整 chat prompt token 上限；超限时显式保留记忆首尾并插入 "
+              "omission marker。缺省不截断，保持原逻辑"),
+    )
     # GRPO-only flags are accepted here so train_grpo can reuse the complete
     # model/data/storage CLI without maintaining a drifting duplicate parser.
     p.add_argument("--reference_checkpoint", default=None)
@@ -143,6 +163,28 @@ def parse_args():
     p.add_argument("--reward_verbosity_weight", type=float, default=0.05)
     p.add_argument("--reward_verbosity_start", type=int, default=32)
     p.add_argument("--reward_verbosity_cap", type=int, default=64)
+    p.add_argument(
+        "--reward_scorer", default="hotpotqa",
+        choices=["hotpotqa", "longmemeval", "locomo"],
+        help="GRPO answer-only reward 的数据集评分口径",
+    )
+    p.add_argument(
+        "--reward_categories", default=None,
+        help="GRPO 原始记录类别白名单，例如 LoCoMo 使用 1,2,3,4",
+    )
+    p.add_argument(
+        "--thinking", action="store_true",
+        help=("GRPO rollout 生成 thinking+answer；reward 只读取 </think> 或 "
+              "Answer: 后的最终答案"),
+    )
+    p.add_argument(
+        "--require_answer_marker", action="store_true",
+        help="thinking GRPO 缺少 </think>/Answer: 标记时计 invalid penalty",
+    )
+    p.add_argument(
+        "--require_thinking", action="store_true",
+        help="thinking GRPO 的 reasoning 为空时计 invalid penalty",
+    )
     # 训练
     p.add_argument("--output_dir", default="checkpoints/inloop")
     p.add_argument("--grad_accum", type=int, default=4, help="每 rank 微步数/优化步")
@@ -171,6 +213,12 @@ def parse_args():
         "--warm_start_id", default=None,
         help="warm-start 父模型的稳定身份（如 S3 URI），用于 checkpoint provenance",
     )
+    p.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help=("对冻结 LLM decoder layer 启用 non-reentrant activation "
+              "checkpointing；用于深层注入/长上下文训练降低峰值显存"),
+    )
     p.add_argument("--seed", type=int, default=None,
                    help="显式固定 TransMem 初始化与数据顺序; 默认保持历史随机行为")
     add_nvme_s3_checkpoint_args(p)
@@ -189,7 +237,8 @@ class InLoopDataset(Dataset):
 
     def __init__(self, data_dir: str, data_path: str, data_format: str,
                  policy: str = "tf", max_samples: int | None = None,
-                 records: list | None = None):
+                 records: list | None = None, fraction: float = 1.0,
+                 sample_seed: int = 42):
         self.data_dir = Path(data_dir)
         with open(self.data_dir / "meta.json") as f:
             self.meta = json.load(f)
@@ -223,11 +272,19 @@ class InLoopDataset(Dataset):
                 drop_cs += 1
                 continue
             entries.append((e["file"], si))
+        if not 0 < fraction <= 1:
+            raise ValueError(f"data fraction 必须在 (0,1]，得到 {fraction}")
+        source_size = len(entries)
+        if fraction < 1 and entries:
+            keep = max(1, int(math.floor(source_size * fraction + 0.5)))
+            chosen = sorted(random.Random(sample_seed).sample(range(source_size), keep))
+            entries = [entries[i] for i in chosen]
         if max_samples:
             entries = entries[:max_samples]
         self.entries = entries
         print(f"InLoopDataset: {len(entries)} 样本 from {self.data_dir} "
-              f"(drop: 无context {drop_ctx}, 无cs_text {drop_cs})")
+              f"(source={source_size}, fraction={fraction:g}, seed={sample_seed}; "
+              f"drop: 无context {drop_ctx}, 无cs_text {drop_cs})")
 
     def __len__(self):
         return len(self.entries)
@@ -238,7 +295,9 @@ class InLoopDataset(Dataset):
         rec = self.records[si]
         return {"context": rec["context"], "question": rec["question"],
                 "cs_text": rec.get("cs_text", ""),
-                "answer_ids": d["answer_ids"], "hq_tea": d["hq_tea"]}
+                "answer_ids": d["answer_ids"], "hq_tea": d["hq_tea"],
+                "sample_idx": si, "feature_file": f,
+                "data_dir": str(self.data_dir)}
 
 
 def collate_first(batch):
@@ -247,7 +306,8 @@ def collate_first(batch):
 
 
 def build_inloop_dataset(data_dirs, data_paths, data_formats, policy,
-                         max_samples=None, records=None):
+                         max_samples=None, records=None, data_fractions=None,
+                         data_sample_seed=42):
     """多源混合 (如 hqa+LME 自然混合): 三参均可逗号分隔, path/format 单值时广播.
     返回 (dataset, sub_datasets) — 上层用 sub 列表做 N/pool 校验."""
     dirs = [d.strip() for d in str(data_dirs).split(",") if d.strip()]
@@ -257,11 +317,19 @@ def build_inloop_dataset(data_dirs, data_paths, data_formats, policy,
         paths *= len(dirs)
     if len(fmts) == 1:
         fmts *= len(dirs)
+    fractions = ([1.0] * len(dirs) if data_fractions is None else
+                 [float(x.strip()) for x in str(data_fractions).split(",")])
     assert len(dirs) == len(paths) == len(fmts), \
         f"多源参数长度不一致: dirs={dirs} paths={paths} formats={fmts}"
-    subs = [InLoopDataset(d, p, f, policy=policy, max_samples=max_samples,
-                          records=records)
-            for d, p, f in zip(dirs, paths, fmts)]
+    assert len(fractions) == len(dirs), \
+        f"data_fractions 数量不一致: dirs={dirs} fractions={fractions}"
+    subs = [InLoopDataset(
+                d, p, f, policy=policy, max_samples=max_samples,
+                records=records, fraction=fraction,
+                sample_seed=int(data_sample_seed) + source_idx,
+            )
+            for source_idx, (d, p, f, fraction) in enumerate(
+                zip(dirs, paths, fmts, fractions))]
     ds = subs[0] if len(subs) == 1 else torch.utils.data.ConcatDataset(subs)
     return ds, subs
 
@@ -296,6 +364,18 @@ class InLoopTrainer:
         self.model = model
         self.tok = tokenizer
         self.model.requires_grad_(False)
+        if getattr(args, "gradient_checkpointing", False):
+            # Qwen3 decoder layers inherit GradientCheckpointingLayer, whose
+            # checkpoint path is active only in train mode.  Qwen3 uses zero
+            # attention/residual dropout, so this changes memory/computation,
+            # not the frozen LLM function.  Non-reentrant mode supports hooks
+            # and side outputs used by layered TransMem.
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
+            self.model.train()
+            if self.is_main:
+                print("Frozen LLM activation checkpointing: enabled "
+                      "(non-reentrant)")
         n_layers = len(self.model.model.layers)
 
         inject = resolve_inject_layers(
@@ -306,6 +386,10 @@ class InLoopTrainer:
         )
         cfg = LayeredConfig.from_json(args.config)
         cfg.inject_layers = inject
+        # Training topology is an explicit CLI ablation.  Do not let a stale
+        # JSON config silently switch the feature source behind runner output
+        # isolation and checkpoint-resume checks.
+        cfg.transmem_before = bool(getattr(args, "transmem_before", False))
         cfg.__post_init__()
         self.config = cfg
         init_scheme = getattr(args, "init_scheme", "scratch_joint")
@@ -325,6 +409,12 @@ class InLoopTrainer:
         if init_scheme == "legacy_gate":
             checkpoint = torch.load(
                 init_checkpoint, map_location="cpu", weights_only=False)
+            parent_before = bool(
+                checkpoint.get("config", {}).get("transmem_before", False))
+            if parent_before != cfg.transmem_before:
+                raise ValueError(
+                    "legacy_gate 父 checkpoint 的 transmem_before 语义与当前配置不一致: "
+                    f"parent={parent_before}, current={cfg.transmem_before}")
             load_legacy_gate_state(self.mem, checkpoint)
             self.parent_checkpoint = str(Path(init_checkpoint).expanduser().resolve())
             del checkpoint
@@ -391,6 +481,7 @@ class InLoopTrainer:
         if self.is_main:
             print(f"InLoop[{args.policy}]: {self.mem.num_params():,} params, "
                   f"inject={cfg.inject_layers} (D={len(cfg.inject_layers)}), "
+                  f"source={'pre-block' if cfg.transmem_before else 'post-block'}, "
                   f"LLM {n_layers} 层冻结, gate={cfg.gate_mode}, init={init_scheme}"
                   + (f" | 手动DDP x{self.world}" if self.world > 1 else ""))
 
@@ -497,6 +588,32 @@ class InLoopTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         return float(gn), stepped
 
+    def _log_fatal_oom(self, item: dict, *, phase: str) -> None:
+        """Print actionable sample/GPU context, then caller re-raises the OOM."""
+        allocated = reserved = peak = 0
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(self.device)
+            reserved = torch.cuda.memory_reserved(self.device)
+            peak = torch.cuda.max_memory_allocated(self.device)
+        question = str(item.get("question", "")).replace("\n", " ")[:160]
+        answer_ids = item.get("answer_ids")
+        answer_tokens = int(answer_ids.shape[0]) if answer_ids is not None else -1
+        print(
+            "FATAL CUDA OOM — fail-fast; no sample was skipped and no "
+            "optimizer/global step will be recorded.\n"
+            f"  phase={phase} rank={self.rank}/{self.world} "
+            f"global_step={self.global_step} epoch={self.epoch}\n"
+            f"  data_dir={item.get('data_dir', '<unknown>')}\n"
+            f"  sample_idx={item.get('sample_idx', '<unknown>')} "
+            f"feature_file={item.get('feature_file', '<unknown>')}\n"
+            f"  context_chars={len(str(item.get('context', '')))} "
+            f"answer_tokens={answer_tokens} question={question!r}\n"
+            f"  cuda_allocated={allocated} cuda_reserved={reserved} "
+            f"cuda_peak_allocated={peak}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     # ── 验证: 恒 tf (确定性, 与训练目标同构), 样本按 rank 分片 ──────────
     @torch.no_grad()
     def validate(self, val_ds):
@@ -505,11 +622,12 @@ class InLoopTrainer:
         kl_sum, pos, top1_sum = 0.0, 0, 0.0
         gate_sum = gate_std_sum = delta_sum = 0.0
         for i in range(self.rank, n, self.world):
+            item = val_ds[i]
             try:
-                r = self.micro_loss(val_ds[i], policy="tf")
+                r = self.micro_loss(item, policy="tf")
             except torch.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                continue
+                self._log_fatal_oom(item, phase=f"validation[index={i}]")
+                raise
             if r is None:
                 continue
             loss, M, m = r
@@ -617,6 +735,12 @@ class InLoopTrainer:
             raise ValueError(
                 "resume checkpoint train_mode 不匹配: "
                 f"checkpoint={checkpoint_mode}, expected={expected_mode}")
+        checkpoint_before = bool(
+            ckpt.get("config", {}).get("transmem_before", False))
+        if checkpoint_before != self.config.transmem_before:
+            raise ValueError(
+                "resume checkpoint 的 transmem_before 语义与当前配置不一致: "
+                f"checkpoint={checkpoint_before}, current={self.config.transmem_before}")
         validate_dynamic_resume_checkpoint(
             ckpt,
             config=self.config.to_dict(),
@@ -828,9 +952,16 @@ class InLoopTrainer:
     # ── 主循环 ──────────────────────────────────────────────────────────
     def run(self):
         args = self.args
+        train_mix_kwargs = {}
+        if getattr(args, "data_fractions", None) is not None:
+            train_mix_kwargs = {
+                "data_fractions": args.data_fractions,
+                "data_sample_seed": getattr(args, "data_sample_seed", 42),
+            }
         train_ds, subs = build_inloop_dataset(
             args.data_dir, args.data_path, args.data_format,
-            policy=args.policy, max_samples=args.max_samples)
+            policy=args.policy, max_samples=args.max_samples,
+            **train_mix_kwargs)
         for sub in subs:
             if not sub.teacher_only_pool:
                 assert self.config.n_mem == sub.N, \
@@ -930,13 +1061,14 @@ class InLoopTrainer:
                         n_micro += 1
                         last_metrics = m
                 except torch.OutOfMemoryError:
-                    # 超长样本 (LME ~122k+梯度) OOM: 本 rank 本累积组梯度作废后跳过 —
-                    # 微步计数照常推进, 各 rank allreduce 次数不变 (同步安全);
-                    # 代价是该步梯度少一个 rank 的贡献 (可接受的偏差)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    torch.cuda.empty_cache()
-                    print(f"  ⚠️ rank{self.rank} OOM 跳样本 "
-                          f"(~{item['answer_ids'].shape[0]} ans tok), 本组梯度作废")
+                    self._log_fatal_oom(
+                        item,
+                        phase=f"training[micro={micro_in_step + 1}/{args.grad_accum}]",
+                    )
+                    # Preserve the original CUDA traceback and terminate this
+                    # rank. torchrun then terminates every peer rank.  OOM is
+                    # never converted into a skipped sample or a fake step.
+                    raise
                 micro_in_step += 1
                 if micro_in_step < args.grad_accum:
                     continue

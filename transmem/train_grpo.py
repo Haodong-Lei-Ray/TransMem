@@ -8,15 +8,20 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-from transmem.extract_features import build_chat_prompt_ids, load_records
+from transmem.extract_features import (
+    build_chat_prompt_ids,
+    fit_context_to_prompt_budget,
+    load_records,
+)
 from transmem.layered import LayeredRollout, TransMemLayered
 from transmem.rl import (
     grpo_clipped_loss,
     group_relative_advantages,
-    hotpot_answer_reward,
     sampled_reference_kl,
+    split_thinking_answer,
+    task_answer_reward,
 )
 from transmem.train_inloop import (
     InLoopDataset,
@@ -26,25 +31,38 @@ from transmem.train_inloop import (
 )
 
 
-class RewardDataset(InLoopDataset):
-    """Manifest-aligned raw records without loading unused Stage0 tensors."""
+class RewardDataset(Dataset):
+    """Raw online-RL prompts; GRPO does not consume Stage0 teacher tensors."""
 
     def __init__(self, data_dir: str, data_path: str, data_format: str,
-                 *, records: list | None = None, max_samples: int | None = None):
-        super().__init__(
-            data_dir, data_path, data_format, policy="tf",
-            records=records, max_samples=max_samples)
+                 *, records: list | None = None, max_samples: int | None = None,
+                 categories: set[int] | None = None):
+        del data_dir
+        source = (records if records is not None
+                  else load_records(data_path, data_format, None))
+        self.records = [
+            record for record in source
+            if record.get("context") and record.get("question")
+            and record.get("ground_truth") not in (None, "")
+            and (categories is None or int(record.get("category", -1)) in categories)
+        ]
+        if max_samples:
+            self.records = self.records[:max_samples]
+        self.data_path = str(data_path)
+
+    def __len__(self) -> int:
+        return len(self.records)
 
     def __getitem__(self, index: int) -> dict:
-        feature_file, sample_index = self.entries[index]
-        record = self.records[sample_index]
+        record = self.records[index]
         return {
             "context": record["context"],
             "question": record["question"],
             "ground_truth": record.get("ground_truth", ""),
-            "sample_idx": sample_index,
-            "feature_file": feature_file,
-            "data_dir": str(self.data_dir),
+            "category": record.get("category"),
+            "question_id": record.get("question_id", ""),
+            "sample_idx": record.get("sample_idx", index),
+            "data_path": self.data_path,
         }
 
 
@@ -75,6 +93,18 @@ class GRPOTrainer(InLoopTrainer):
             "group_size": self.args.group_size,
             "clip_eps": self.args.clip_eps,
             "reference_kl_beta": self.args.reference_kl_beta,
+            "thinking": bool(getattr(self.args, "thinking", False)),
+            "reward_scorer": getattr(self.args, "reward_scorer", "hotpotqa"),
+            "require_answer_marker": bool(
+                getattr(self.args, "require_answer_marker", False)),
+            "require_thinking": bool(
+                getattr(self.args, "require_thinking", False)),
+            "max_prompt_tokens": getattr(self.args, "max_prompt_tokens", None),
+            "data_path": str(self.args.data_path),
+            "data_format": str(self.args.data_format),
+            "reward_categories": getattr(self.args, "reward_categories", None),
+            "max_answer_tokens": int(self.args.max_answer_tokens),
+            "seed": getattr(self.args, "seed", None),
         }
 
     def validate_checkpoint_metadata(self, checkpoint: dict) -> None:
@@ -134,11 +164,16 @@ class GRPOTrainer(InLoopTrainer):
         if not ground_truth:
             raise ValueError(
                 f"GRPO 样本缺 ground_truth: sample_idx={item.get('sample_idx')}")
+        thinking = bool(getattr(self.args, "thinking", False))
+        context_for_prompt = fit_context_to_prompt_budget(
+            self.tok, context, question,
+            getattr(self.args, "max_prompt_tokens", None), thinking)
         cq_ids = build_chat_prompt_ids(
-            self.tok, context, question, self.device)
+            self.tok, context_for_prompt, question, self.device,
+            thinking=thinking)
         len_cq = cq_ids.shape[1]
         len_cl = self.tok(
-            context, return_tensors="pt",
+            context_for_prompt, return_tensors="pt",
             add_special_tokens=False).input_ids.shape[1]
 
         candidates = []
@@ -148,12 +183,23 @@ class GRPOTrainer(InLoopTrainer):
                 cq_ids, len_cl, max_new=self.args.max_answer_tokens,
                 sample=True, temperature=self.args.sample_temp,
                 return_log_probs=True)
-            prediction = self.tok.decode(
+            raw_prediction = self.tok.decode(
                 answer_ids, skip_special_tokens=True).strip()
-            reward = hotpot_answer_reward(
-                prediction,
+            parsed = split_thinking_answer(raw_prediction)
+            final_answer_tokens = len(self.tok(
+                parsed.answer, add_special_tokens=False).input_ids)
+            valid_format = (
+                parsed.has_answer_marker
+                or not bool(getattr(self.args, "require_answer_marker", False)))
+            if bool(getattr(self.args, "require_thinking", False)):
+                valid_format = valid_format and bool(parsed.thinking.strip())
+            reward = task_answer_reward(
+                parsed.answer,
                 ground_truth,
-                len(answer_ids),
+                final_answer_tokens,
+                scorer=getattr(self.args, "reward_scorer", "hotpotqa"),
+                category=item.get("category"),
+                valid_format=valid_format,
                 em_weight=self.args.reward_em_weight,
                 verbosity_weight=self.args.reward_verbosity_weight,
                 verbosity_start=self.args.reward_verbosity_start,
@@ -175,6 +221,11 @@ class GRPOTrainer(InLoopTrainer):
                 "old_log_probs": old_log_probs.detach().cpu(),
                 "reference_log_probs": reference_log_probs.detach().cpu(),
                 "reward": reward,
+                "raw_prediction": raw_prediction,
+                "thinking": parsed.thinking,
+                "answer": parsed.answer,
+                "format_valid": valid_format,
+                "answer_token_count": final_answer_tokens,
             })
         self.mem.train()
 
@@ -196,8 +247,10 @@ class GRPOTrainer(InLoopTrainer):
                 "question": question,
                 "context": context,
                 "sample_idx": item.get("sample_idx"),
-                "feature_file": item.get("feature_file"),
-                "data_dir": item.get("data_dir"),
+                "question_id": item.get("question_id"),
+                "data_path": item.get("data_path"),
+                "context_chars": len(context),
+                "used_context_chars": len(context_for_prompt),
             },
         }
 
@@ -261,7 +314,16 @@ class GRPOTrainer(InLoopTrainer):
             "em": sum(reward.em for reward in rewards) / count,
             "verbosity_penalty": (
                 sum(reward.verbosity_penalty for reward in rewards) / count),
+            "invalid_penalty": (
+                sum(reward.invalid_penalty for reward in rewards) / count),
+            "format_valid": (
+                sum(float(candidate["format_valid"]) for candidate in candidates) / count),
+            "thinking_tokens": (
+                sum(len(candidate["answer_ids"]) - candidate["answer_token_count"]
+                    for candidate in candidates) / count),
             "answer_tokens": (
+                sum(candidate["answer_token_count"] for candidate in candidates) / count),
+            "response_tokens": (
                 sum(len(candidate["answer_ids"]) for candidate in candidates) / count),
         }
 
@@ -270,9 +332,15 @@ class GRPOTrainer(InLoopTrainer):
         if "," in args.data_dir or "," in args.data_path or "," in args.data_format:
             raise ValueError("首版 GRPO 只接受一个训练数据源")
         records = load_records(args.data_path, args.data_format, None)
+        reward_categories = getattr(args, "reward_categories", None)
+        categories = ({int(value) for value in reward_categories.split(",")}
+                      if reward_categories else None)
         train_ds = RewardDataset(
             args.data_dir, args.data_path, args.data_format,
-            records=records, max_samples=args.max_samples)
+            records=records, max_samples=args.max_samples,
+            categories=categories)
+        if not train_ds:
+            raise ValueError("GRPO 过滤后没有可训练的原始 QA")
         val_ds = (InLoopDataset(
             args.val_data_dir, args.val_data_path,
             args.val_data_format or args.data_format, policy="tf")
@@ -298,7 +366,9 @@ class GRPOTrainer(InLoopTrainer):
                 f"global_prompt_batch={self.world}x{args.grad_accum}, "
                 f"reuse_epochs={args.grpo_epochs}, total_steps={total_steps}, "
                 f"temp={args.sample_temp}, "
-                f"clip={args.clip_eps}, ref_kl_beta={args.reference_kl_beta}")
+                f"clip={args.clip_eps}, ref_kl_beta={args.reference_kl_beta}, "
+                f"thinking={getattr(args, 'thinking', False)}, "
+                f"reward_scorer={getattr(args, 'reward_scorer', 'hotpotqa')}")
 
         rollout_buffer: list[dict] = []
         aggregate: dict[str, float] = {}
@@ -399,6 +469,13 @@ class GRPOTrainer(InLoopTrainer):
             "grpo_epochs": args.grpo_epochs,
             "clip_eps": args.clip_eps,
             "reference_kl_beta": args.reference_kl_beta,
+            "thinking": bool(getattr(args, "thinking", False)),
+            "reward_scorer": getattr(args, "reward_scorer", "hotpotqa"),
+            "require_answer_marker": bool(
+                getattr(args, "require_answer_marker", False)),
+            "require_thinking": bool(
+                getattr(args, "require_thinking", False)),
+            "max_prompt_tokens": getattr(args, "max_prompt_tokens", None),
         })
         if self.writer:
             self.writer.close()

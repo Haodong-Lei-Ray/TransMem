@@ -62,7 +62,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Stage 0: 离线抽取 LLM hidden states (TransMem)")
     p.add_argument("--data_path", required=True, help="数据路径 (.parquet 或 .json)")
     p.add_argument("--data_format", default="parquet",
-                   choices=["parquet", "json", "qasper", "hotpotqa-agentmem", "longmemeval"])
+                   choices=["parquet", "json", "qasper", "hotpotqa-agentmem", "longmemeval",
+                            "locomo"])
     p.add_argument("--model_path", required=True, help="Qwen3-4B-Instruct-2507 路径")
     p.add_argument("--output_dir", required=True, help="输出目录, 写 sharded .pt + lm_head.pt")
     p.add_argument("--device", default="cuda:0")
@@ -173,6 +174,8 @@ def load_records(data_path: str, data_format: str, max_samples: Optional[int]):
         return _load_hotpotqa_agentmem(data_path, max_samples)
     if data_format == "longmemeval":
         return _load_longmemeval(data_path, max_samples)
+    if data_format == "locomo":
+        return _load_locomo(data_path, max_samples)
     with open(data_path) as f:
         raw = json.load(f)
     if data_format == "qasper":
@@ -332,6 +335,178 @@ def _load_longmemeval(data_path: str, max_samples: Optional[int]):
     if n_no_ev:
         print(f"  longmemeval: {n_no_ev}/{len(records)} 条证据 session 为空 (将被跳过)")
     print(f"  longmemeval: {len(records)} 条已加载")
+    return records
+
+
+# ── LoCoMo: 多日双人对话; 每道 QA 展平为一条 Stage0 样本 ──
+
+_LOCOMO_CONV_START = (
+    "Below is a conversation between two people: {} and {}. "
+    "The conversation takes place over multiple days and the date of each conversation "
+    "is wriiten at the beginning of the conversation.\n\n"
+)
+_LOCOMO_QA_PROMPT = (
+    "Based on the above conversations, write a short answer for the following question "
+    "in a few words. Do not write complete and lengthy sentences. "
+    "Answer with exact words from the conversations whenever possible.\n\n"
+    "Question: {}"
+)
+_LOCOMO_EVIDENCE_RADIUS = 5
+
+
+def _locomo_session_nums(conversation: dict) -> list[int]:
+    return sorted(
+        int(key.split("_")[-1])
+        for key in conversation
+        if key.startswith("session_") and not key.endswith("date_time")
+    )
+
+
+def _render_locomo_turn(dialog: dict) -> str:
+    """Match delta-Mem's official LoCoMo rendering used by eval_locomo.py."""
+    turn = f'{dialog["speaker"]} said, "{dialog["text"]}"\n'
+    if dialog.get("blip_caption"):
+        turn += f' and shared {dialog["blip_caption"]}.'
+    return turn + "\n"
+
+
+def _normalize_locomo_evidence(conversation: dict, evidence: list[str]) -> tuple[list[str], int]:
+    """Repair only malformed labels whose intended ``Dx:y`` is unambiguous.
+
+    The sampled training JSON currently contains ``D:11:26`` (extra colon) and
+    a bare ``D`` between ``D1:18``/``D1:20``. Keep the source JSON untouched,
+    but recover those turns deterministically in the adapter.
+    """
+    known = {
+        str(dialog.get("dia_id", f"D{session_num}:{turn_idx}"))
+        for session_num in _locomo_session_nums(conversation)
+        for turn_idx, dialog in enumerate(
+            conversation.get(f"session_{session_num}", []), start=1
+        )
+    }
+    repaired = 0
+    result = []
+    for idx, raw_label in enumerate(evidence):
+        label = str(raw_label)
+        candidate = label
+        extra_colon = re.fullmatch(r"D:(\d+):(\d+)", label)
+        if extra_colon:
+            candidate = f"D{extra_colon.group(1)}:{extra_colon.group(2)}"
+        elif label == "D" and 0 < idx < len(evidence) - 1:
+            prev = re.fullmatch(r"D(\d+):(\d+)", str(evidence[idx - 1]))
+            nxt = re.fullmatch(r"D(\d+):(\d+)", str(evidence[idx + 1]))
+            if prev and nxt and prev.group(1) == nxt.group(1):
+                prev_turn, next_turn = int(prev.group(2)), int(nxt.group(2))
+                if next_turn == prev_turn + 2:
+                    candidate = f"D{prev.group(1)}:{prev_turn + 1}"
+        if candidate != label and candidate in known:
+            repaired += 1
+            label = candidate
+        result.append(label)
+    return result, repaired
+
+
+def _render_locomo_context(
+    conversation: dict,
+    evidence: Optional[list[str]] = None,
+    evidence_radius: int = 0,
+) -> str:
+    """Render full history or evidence windows for C_S.
+
+    For every evidence ``dia_id``, include up to ``evidence_radius`` preceding
+    and following turns from the same session. Overlapping windows are merged
+    and rendered once in original order. Speaker names and each selected
+    session's date are always retained.
+    """
+    if evidence_radius < 0:
+        raise ValueError(f"evidence_radius must be non-negative, got {evidence_radius}")
+    wanted = {str(item) for item in (evidence or [])}
+    evidence_only = evidence is not None
+    parts = []
+    for session_num in _locomo_session_nums(conversation):
+        session_key = f"session_{session_num}"
+        dialogs = conversation.get(session_key, [])
+        selected_indices: set[int] = set()
+        if evidence_only:
+            for turn_idx, dialog in enumerate(dialogs, start=1):
+                dia_id = str(dialog.get("dia_id", f"D{session_num}:{turn_idx}"))
+                if dia_id in wanted:
+                    lo = max(0, turn_idx - 1 - evidence_radius)
+                    hi = min(len(dialogs), turn_idx + evidence_radius)
+                    selected_indices.update(range(lo, hi))
+        rendered = []
+        for dialog_idx, dialog in enumerate(dialogs):
+            if not evidence_only or dialog_idx in selected_indices:
+                rendered.append(_render_locomo_turn(dialog))
+        if rendered:
+            date = conversation.get(f"{session_key}_date_time", "")
+            parts.append(f"DATE: {date}\nCONVERSATION:\n{''.join(rendered).rstrip()}")
+    start = _LOCOMO_CONV_START.format(
+        conversation.get("speaker_a", "Speaker A"),
+        conversation.get("speaker_b", "Speaker B"),
+    )
+    return start + "\n\n".join(parts)
+
+
+def _load_locomo(data_path: str, max_samples: Optional[int]):
+    """Load LoCoMo's conversation-level JSON and flatten its QA list.
+
+    C_L is the full dated conversation. C_S contains every evidence turn plus five
+    neighboring turns on each side within the same session. Category-2 questions
+    keep the official temporal hint. The
+    resulting sample_idx is global across questions so Stage0 and in-loop loaders
+    can join the manifest deterministically.
+    """
+    with open(data_path) as f:
+        raw = json.load(f)
+    samples = raw if isinstance(raw, list) else [raw]
+    records = []
+    no_evidence = 0
+    repaired_evidence = 0
+    for conv_idx, sample in enumerate(samples):
+        conversation = sample.get("conversation") or {}
+        full_context = _render_locomo_context(conversation)
+        sample_id = str(sample.get("sample_id", conv_idx))
+        for question_idx, qa in enumerate(sample.get("qa") or []):
+            category = int(qa.get("category", 0))
+            question = str(qa.get("question", "")).strip()
+            if category == 2:
+                question += " Use DATE of CONVERSATION to answer with an approximate date."
+            evidence, repaired = _normalize_locomo_evidence(
+                conversation,
+                [str(item) for item in (qa.get("evidence") or [])],
+            )
+            repaired_evidence += repaired
+            cs_text = _render_locomo_context(
+                conversation,
+                evidence,
+                evidence_radius=_LOCOMO_EVIDENCE_RADIUS,
+            )
+            # A missing evidence list must remain empty so teacher trajectory skips
+            # the sample instead of accidentally seeing the full conversation.
+            if not evidence:
+                cs_text = ""
+                no_evidence += 1
+            records.append({
+                "question": _LOCOMO_QA_PROMPT.format(question),
+                "context": full_context,
+                "cs_text": cs_text,
+                "golden_index": None,
+                "ground_truth": str(qa.get("answer", "")).strip(),
+                "sample_idx": len(records),
+                "question_id": f"{sample_id}:{question_idx}",
+                "question_type": f"locomo_category_{category}",
+                "category": category,
+            })
+            if max_samples and len(records) >= max_samples:
+                break
+        if max_samples and len(records) >= max_samples:
+            break
+    if no_evidence:
+        print(f"  locomo: {no_evidence}/{len(records)} 道题 evidence 为空 (将被跳过)")
+    if repaired_evidence:
+        print(f"  locomo: 确定性修复 {repaired_evidence} 个畸形 evidence 标签")
+    print(f"  locomo: {len(records)} 道 QA 已从 {len(samples)} 个 conversation 展平")
     return records
 
 
@@ -1092,8 +1267,9 @@ def _supports_enable_thinking(tokenizer) -> bool:
     return "enable_thinking" in chat_template
 
 
-def build_chat_prompt_ids(tokenizer, context: str, question: str, device=None, thinking=False):
-    """按 chat template 构造 prompt token ids (add_generation_prompt=True).
+def _render_chat_prompt(tokenizer, context: str, question: str,
+                        thinking: bool = False) -> str:
+    """Render the shared QA chat prompt before tokenization.
 
     这样是"对话"而非"文本续写", 模型答完会正常吐 <|im_end|>(151645) 停下,
     AN 自适应真实答案长度, 不再一路跑到 max_answer_tokens (官方推荐用法).
@@ -1102,18 +1278,85 @@ def build_chat_prompt_ids(tokenizer, context: str, question: str, device=None, t
     template_kwargs = {}
     if _supports_enable_thinking(tokenizer):
         # hybrid-thinking 模型: 用官方开关控制, 不走 system prompt 文字 hack.
-        system_prompt_item = {"role": "system", "content": "You are a precise QA assistant."}
+        # thinking=False 的 system prompt 不可改动 (主线训练/评测对齐前提).
+        if thinking:
+            system_prompt_item = {"role": "system", "content": "You are a precise QA assistant. You need to think carefully about the context: go through the relevant parts of the context and check the facts in your reasoning. After thinking, answer ONLY with the short answer. No explanation."}
+        else:
+            system_prompt_item = {"role": "system", "content": "You are a precise QA assistant."}
         template_kwargs["enable_thinking"] = thinking
     elif thinking:
-        system_prompt_item = {"role": "system", "content": "You are a precise QA assistant. Answer with the short answer and thinking. If you encounter a math problem, you should calculate it step by step. Think it through several times and criticize yourself a few times."}
+        # 纯 instruct 模型 (无 <think> 能力, 如 Qwen3-4B-Instruct-2507): prompt hack —
+        # 明文思考后以 'Answer:' 行收尾, 评测侧按该标记切分 thinking/answer.
+        system_prompt_item = {"role": "system", "content": "You are a precise QA assistant. You need to think carefully about the context: first reason step by step through the relevant parts of the context, then write a new line starting with 'Answer:' followed by ONLY the short final answer. Keep the final answer short - no explanation after 'Answer:'."}
     else:
         system_prompt_item = {"role": "system", "content": "You are a precise QA assistant. Answer ONLY with the short answer. No explanation."}
     messages = [
         system_prompt_item,
         {"role": "user", "content": _make_prompt(context, question)}
         ]
-    text = tokenizer.apply_chat_template(
+    return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, **template_kwargs)  # 官方示例写法
+
+
+def fit_context_to_prompt_budget(tokenizer, context: str, question: str,
+                                 max_prompt_tokens: int | None,
+                                 thinking: bool = False) -> str:
+    """Deterministically retain context head/tail within a prompt token budget.
+
+    The default ``None`` preserves the historical full-context behavior.  This
+    opt-in path is needed for Qwen2.5-14B (32K context) on LongMemEval.  It is
+    deliberately visible in the prompt and checkpoint metadata: no caller can
+    silently claim a full-context run after truncation.
+    """
+    if max_prompt_tokens is None:
+        return context
+    if max_prompt_tokens < 256:
+        raise ValueError("max_prompt_tokens must be >= 256")
+    text = _render_chat_prompt(tokenizer, context, question, thinking)
+    full_ids = tokenizer(
+        text, add_special_tokens=False, return_tensors=None).input_ids
+    if len(full_ids) <= max_prompt_tokens:
+        return context
+
+    marker = "\n\n[... middle of memory omitted to fit model context ...]\n\n"
+    empty_text = _render_chat_prompt(tokenizer, "", question, thinking)
+    overhead = len(tokenizer(
+        empty_text, add_special_tokens=False, return_tensors=None).input_ids)
+    marker_tokens = tokenizer(
+        marker, add_special_tokens=False, return_tensors=None).input_ids
+    context_ids = tokenizer(
+        context, add_special_tokens=False, return_tensors=None).input_ids
+    keep = max_prompt_tokens - overhead - len(marker_tokens) - 16
+    if keep < 32:
+        raise ValueError(
+            f"question/system prompt leaves no context budget: max={max_prompt_tokens}, "
+            f"overhead={overhead}")
+
+    # Token-boundary interactions with chat rendering can add a few tokens.
+    # Tighten deterministically until the final rendered prompt fits exactly.
+    while keep >= 32:
+        head = keep // 2
+        tail = keep - head
+        cropped = (
+            tokenizer.decode(context_ids[:head], skip_special_tokens=True)
+            + marker
+            + tokenizer.decode(context_ids[-tail:], skip_special_tokens=True)
+        )
+        rendered = _render_chat_prompt(tokenizer, cropped, question, thinking)
+        rendered_ids = tokenizer(
+            rendered, add_special_tokens=False, return_tensors=None).input_ids
+        if len(rendered_ids) <= max_prompt_tokens:
+            return cropped
+        keep -= max(16, len(rendered_ids) - max_prompt_tokens)
+    raise ValueError("unable to fit context into max_prompt_tokens")
+
+
+def build_chat_prompt_ids(tokenizer, context: str, question: str, device=None,
+                          thinking=False, max_prompt_tokens: int | None = None):
+    """按 chat template 构造 prompt token ids (add_generation_prompt=True)."""
+    context = fit_context_to_prompt_budget(
+        tokenizer, context, question, max_prompt_tokens, thinking)
+    text = _render_chat_prompt(tokenizer, context, question, thinking)
     # 模板已含全部特殊 token, add_special_tokens=False 避免再加 bos/eos (与 student 侧一致)
     ids = tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids
     return ids.to(device) if device is not None else ids
@@ -1129,7 +1372,9 @@ def resolve_eos_ids(model) -> list[int]:
 
 def main():
     args = parse_args()
-    if args.num_workers > 1:
+    # --manifest_dir also opts a single worker into the resumable worker path.
+    # Default one-worker callers keep the historical sequential implementation.
+    if args.num_workers > 1 or args.manifest_dir:
         run_parallel(args)
     else:
         extractor = Stage0Extractor(args)

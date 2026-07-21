@@ -15,7 +15,7 @@ PROJ=/mnt/petrelfs/leihaodong/Project4
 RUN_NAME=${RUN_NAME:-v5_opd_qwen3_4b_hqa_d4_rkl_s250}
 export S3_CKPT_REL=${S3_CKPT_REL:-leihaodong/Project4/checkpoints/$RUN_NAME/best.pt}
 export OUT_ROOT=${OUT_ROOT:-$PROJ/eval_results/locomo_$RUN_NAME}
-export GPU_COUNT=4
+export GPU_COUNT=${GPU_COUNT:-4}
 export WORKERS_PER_GPU=${WORKERS_PER_GPU:-2}
 export DATA_FILE=/mnt/petrelfs/leihaodong/OldProjectMaintain/locomo/data/locomo10.json
 

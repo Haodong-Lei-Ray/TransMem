@@ -15,9 +15,9 @@
     插值教上层"无论下层把 hidden 推到 stu→tea 路径哪个位置, 都继续往教师推";
   - 最顶层 (LLM 末层) 走冻结 final_norm + lm_head 的 forward-KL (对齐原配方).
 
-推理 (LayeredRollout): 在 model.model.layers[l] 上挂 forward hook, prefill 时从该层
-输出取 HM^l 并纠正末位查询, 之后每步增量纠正新 token 位; 每层 TransMem 各持
-KV cache (查询 i 因果地看 {HM^l, HQ^l_1..i}).
+推理 (LayeredRollout): 在 model.model.layers[l] 上挂 forward hook. 默认从该层输出
+读取 HM/HQ; 可选 transmem_before 消融改为从该层输入读取 HM/HQ. 两种模式都把
+纠正量加到该层输出, 且每层 TransMem 各持 KV cache.
 
 ckpt config 带 "layered": true, evaluate.py 以此自动分发.
 """
@@ -130,6 +130,7 @@ class LayeredConfig:
     gate_init: float = 1.0
 
     inject_layers: list[int] = field(default_factory=lambda: [35])
+    transmem_before: bool = False
     layered: bool = True          # ckpt 识别标记 (evaluate.py 分发用)
 
     def __post_init__(self):
@@ -152,6 +153,10 @@ class LayeredConfig:
 
     def to_dict(self) -> dict:
         data = asdict(self)
+        # Keep the serialized default byte-for-byte compatible with legacy
+        # checkpoints.  A before-mode checkpoint records the opt-in explicitly.
+        if not self.transmem_before:
+            data.pop("transmem_before")
         if self.gate_mode == "constant":
             for name in (
                 "gate_mode",
@@ -280,11 +285,13 @@ class LayeredRollout:
     """冻结 LLM + TransMemLayered 贪心/采样逐步解码.
 
     每个注入层挂 forward hook:
-      prefill: 该层输出取 HM^l (len_cl 内 N 个槽位) + 末位查询 HQ^l_1,
+      prefill: 特征源取 HM (len_cl 内 N 个槽位) + 末位查询 HQ_1,
                TransMem prefill [HM;HQ_1] → (MS^l_1,g^l_1), 末位 hidden += g*MS;
       decode : 每步新 token 位即当前查询 HQ^l_i, 增量喂 TransMem (KV cache),
                该位 hidden += g^l_i*MS^l_i.
-    纠正后的 hidden 继续流入上层 → 上层的 HQ/KV 都基于纠正后的流 (深注入语义).
+    默认特征源是本层输出 H^l; transmem_before=True 时源改为本层输入 H^(l-1),
+    但纠正目标始终是本层输出 H^l. 纠正后的 hidden 继续流入上层 → 上层的
+    HQ/KV 都基于纠正后的流 (深注入语义).
     LLM 侧 KV cache: 查询位的 K/V 由纠正后 hidden 计算 (与训练语义一致);
     上下文位不受影响 (bias 只加在查询位).
     """
@@ -335,16 +342,20 @@ class LayeredRollout:
             block = self.layered.block(layer_idx)
 
             def hook(_mod, _inp, out):
-                h = out[0] if isinstance(out, tuple) else out       # [1, S, dim]
+                target = out[0] if isinstance(out, tuple) else out  # H^l [1,S,D]
+                source = (_inp[0] if self.layered.config.transmem_before
+                          else target)                               # H^(l-1) or H^l
                 if phase["mode"] == "prefill":
-                    hm = h[0, hm_idx_t, :]                          # [N, dim]
-                    hq = h[:, -1, :]                                # [1, dim]
+                    hm = source[0, hm_idx_t, :]                     # [N, dim]
+                    hq_source = source[:, -1, :]                    # [1, dim]
                     cache = state[layer_idx] = DynamicCache()
-                    X = torch.cat([hm.unsqueeze(0), hq.unsqueeze(1)], dim=1).to(mem_dtype)
+                    X = torch.cat(
+                        [hm.unsqueeze(0), hq_source.unsqueeze(1)], dim=1,
+                    ).to(mem_dtype)
                     proposal = block(X, past_key_values=cache, use_cache=True)
                 else:
-                    hq = h[:, -1, :]
-                    proposal = block(hq.unsqueeze(1).to(mem_dtype),
+                    hq_source = source[:, -1, :]
+                    proposal = block(hq_source.unsqueeze(1).to(mem_dtype),
                                      past_key_values=state[layer_idx], use_cache=True)
                 if trace is not None:
                     layer_trace = trace[str(layer_idx)]
@@ -353,8 +364,8 @@ class LayeredRollout:
                         float(proposal.ms.float().norm(dim=-1).mean()))
                     layer_trace["delta_norm"].append(
                         float(proposal.delta.float().norm(dim=-1).mean()))
-                h = h.clone()
-                h[:, -1, :] = block.correct(hq, proposal)
+                h = target.clone()
+                h[:, -1, :] = block.correct(target[:, -1, :], proposal)
                 if isinstance(out, tuple):
                     return (h,) + tuple(out[1:])
                 return h
@@ -441,19 +452,22 @@ class LayeredRollout:
             block = self.layered.block(layer_idx)
 
             def hook(_mod, _inp, out):
-                h0 = out[0] if isinstance(out, tuple) else out      # [1, T, dim]
-                hm = h0[:, hm_idx, :]                               # [1, N, dim]
-                hq = h0[:, qpos, :]                                 # [1, M, dim]
-                X = torch.cat([hm, hq], dim=1).to(mem_dtype)
+                target = out[0] if isinstance(out, tuple) else out  # H^l [1,T,D]
+                source = (_inp[0] if self.layered.config.transmem_before
+                          else target)                               # H^(l-1) or H^l
+                hm = source[:, hm_idx, :]                           # [1, N, dim]
+                hq_source = source[:, qpos, :]                      # [1, M, dim]
+                X = torch.cat([hm, hq_source], dim=1).to(mem_dtype)
                 proposal = block(X, return_all_queries=True)
                 if return_proposals:
                     captured[layer_idx] = proposal
                 applied = (TransMemOutput(
                     ms=proposal.ms, gate=torch.ones_like(proposal.gate))
                     if force_gate_one else proposal)
-                # 读 h0、写 clone: 无原地读写混叠, autograd 干净
+                # 提案可读 H^(l-1), 但残差基底始终是 H^l; 写 clone 避免混叠.
+                hq_target = target[:, qpos, :]
                 h = replace_query_positions(
-                    h0, qpos, block.correct(hq, applied))
+                    target, qpos, block.correct(hq_target, applied))
                 if isinstance(out, tuple):
                     return (h,) + tuple(out[1:])
                 return h
@@ -485,9 +499,15 @@ class LayeredRollout:
     @torch.no_grad()
     def student_rollout(self, _mem_unused, context_long: str, question: str,
                         max_new: int, sample: bool = False, temperature: float = 1.0,
-                        collect_gate_diagnostics: bool = False):
-        from .extract_features import build_chat_prompt_ids
-        cq_ids = build_chat_prompt_ids(self.tok, context_long, question, self.device)
+                        collect_gate_diagnostics: bool = False,
+                        thinking: bool = False,
+                        max_prompt_tokens: int | None = None):
+        from .extract_features import (
+            build_chat_prompt_ids, fit_context_to_prompt_budget)
+        context_long = fit_context_to_prompt_budget(
+            self.tok, context_long, question, max_prompt_tokens, thinking)
+        cq_ids = build_chat_prompt_ids(
+            self.tok, context_long, question, self.device, thinking=thinking)
         len_cl = self.tok(context_long, return_tensors="pt",
                           add_special_tokens=False).input_ids.shape[1]
         ans_ids = self.generate_from_ids(cq_ids, len_cl, max_new,

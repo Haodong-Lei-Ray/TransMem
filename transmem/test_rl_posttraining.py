@@ -33,6 +33,51 @@ def test_hotpot_reward_matches_official_examples() -> None:
     assert abs(verbose.total - 1.225) < 1e-7, verbose
 
 
+def test_thinking_is_excluded_from_answer_only_reward() -> None:
+    from transmem.rl import split_thinking_answer, task_answer_reward
+
+    hybrid = split_thinking_answer(
+        "<think>Paris is the relevant city.</think>Paris")
+    assert hybrid.thinking == "Paris is the relevant city."
+    assert hybrid.answer == "Paris" and hybrid.has_answer_marker
+
+    instruct = split_thinking_answer(
+        "I should retrieve the city first.\nAnswer: Paris")
+    assert instruct.thinking == "I should retrieve the city first."
+    assert instruct.answer == "Paris" and instruct.has_answer_marker
+    reward = task_answer_reward(
+        instruct.answer, "Paris", 1, scorer="longmemeval",
+        valid_format=instruct.has_answer_marker)
+    assert reward.total == 1.25, reward
+
+    malformed = split_thinking_answer("I think the answer is Paris")
+    invalid = task_answer_reward(
+        malformed.answer, "Paris", 6, scorer="longmemeval",
+        valid_format=malformed.has_answer_marker)
+    assert invalid.invalid_penalty == 1.0, invalid
+
+    no_reasoning = split_thinking_answer("Answer: Paris")
+    structured = bool(
+        no_reasoning.has_answer_marker and no_reasoning.thinking.strip())
+    invalid = task_answer_reward(
+        no_reasoning.answer, "Paris", 1, scorer="longmemeval",
+        valid_format=structured)
+    assert invalid.invalid_penalty == 1.0, invalid
+
+
+def test_locomo_reward_uses_category_specific_answer_f1() -> None:
+    from transmem.rl import task_answer_reward
+
+    multi = task_answer_reward(
+        "hiking, painting", "painting, hiking", 3,
+        scorer="locomo", category=1)
+    assert multi.f1 == 1.0, multi
+    open_domain = task_answer_reward(
+        "New York", "New York; NYC", 2,
+        scorer="locomo", category=3)
+    assert open_domain.f1 == 1.0 and open_domain.em == 1.0, open_domain
+
+
 def test_group_advantages_are_centered_and_constant_groups_are_zero() -> None:
     from transmem.rl import group_relative_advantages
 
@@ -240,6 +285,8 @@ def test_grpo_group_backward_updates_only_transmem() -> None:
 
 if __name__ == "__main__":
     test_hotpot_reward_matches_official_examples()
+    test_thinking_is_excluded_from_answer_only_reward()
+    test_locomo_reward_uses_category_specific_answer_f1()
     test_group_advantages_are_centered_and_constant_groups_are_zero()
     test_grpo_clipping_and_reference_kl()
     test_rollout_returns_behavior_policy_log_probs()

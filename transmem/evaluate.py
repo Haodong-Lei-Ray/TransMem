@@ -53,6 +53,8 @@ def parse_args():
     p.add_argument("--config", default="transmem/config.json")
     p.add_argument("--N", type=int, default=4)
     p.add_argument("--max_answer_tokens", type=int, default=50)
+    p.add_argument("--max_prompt_tokens", type=int, default=None,
+                   help="可选 chat prompt 上限；超限时显式保留 context 首尾")
     p.add_argument("--max_samples", type=int, default=128)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
@@ -61,6 +63,9 @@ def parse_args():
     p.add_argument("--print_examples", type=int, default=3)
     p.add_argument("--gate_diagnostics", default=None,
                    help="可选 JSON 路径: 保存逐样本/逐 token/逐层 gate 轨迹")
+    p.add_argument("--thinking", action="store_true",
+                   help="思考模式: hybrid 模型走 enable_thinking 官方开关, "
+                        "纯 instruct 模型走 system prompt hack (teacher/student 贪心路径)")
     return p.parse_args()
 
 
@@ -153,7 +158,10 @@ class Evaluator:
     @torch.no_grad()
     def _greedy_plain(self, context: str, question: str) -> str:
         """冻结 LLM 贪心解码 (无 TransMem), 用于 teacher / student 基线."""
-        cq_ids = build_chat_prompt_ids(self.tok, context, question, self.device)
+        cq_ids = build_chat_prompt_ids(
+            self.tok, context, question, self.device,
+            thinking=getattr(self.args, "thinking", False),
+            max_prompt_tokens=getattr(self.args, "max_prompt_tokens", None))
         gen = self.model.generate(
             input_ids=cq_ids, attention_mask=torch.ones_like(cq_ids),
             max_new_tokens=self.args.max_answer_tokens, do_sample=False,
@@ -164,10 +172,19 @@ class Evaluator:
     @torch.no_grad()
     def _greedy_transmem(self, context_long: str, question: str) -> str:
         """冻结 LLM + TransMem 贪心逐步解码 (§6): TransMem 在环."""
+        rollout_kwargs = {
+            "sample": False,
+            "temperature": 1.0,
+            "collect_gate_diagnostics": bool(self.args.gate_diagnostics),
+        }
+        if hasattr(self.rollout, "layered"):
+            rollout_kwargs["thinking"] = bool(
+                getattr(self.args, "thinking", False))
+            rollout_kwargs["max_prompt_tokens"] = getattr(
+                self.args, "max_prompt_tokens", None)
         _, _, ans_ids = self.rollout.student_rollout(
             self.mem, context_long, question, self.args.max_answer_tokens,
-            sample=False, temperature=1.0,
-            collect_gate_diagnostics=bool(self.args.gate_diagnostics))
+            **rollout_kwargs)
         self._last_gate_trace = self.rollout.last_gate_trace
         return self.tok.decode(ans_ids, skip_special_tokens=True).strip()
 
