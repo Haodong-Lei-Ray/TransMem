@@ -19,4 +19,4 @@ export GPU_COUNT=4
 export WORKERS_PER_GPU=${WORKERS_PER_GPU:-2}
 export DATA_FILE=/mnt/petrelfs/leihaodong/OldProjectMaintain/locomo/data/locomo10.json
 
-exec "$PROJ/scripts/version4/run_eval_locomo_s32_parallel.sh"
+exec bash "$PROJ/scripts/version4/run_eval_locomo_s32_parallel.sh"
