@@ -9,6 +9,7 @@ PROJ=/mnt/petrelfs/leihaodong/Project4
 PARTITION=DataFrontier_Explore
 PROBE_SECONDS=${PROBE_SECONDS:-30}
 MAX_STEPS=${MAX_STEPS:-50}
+GPU_LEVELS=${GPU_LEVELS:-"8 7 6 5 4 3 2"}
 TRAIN_SCRIPT=$PROJ/scripts/version5/rl/run_train_grpo_memory_d4.sh
 LOCOMO_EVAL=$PROJ/scripts/version5/rl/run_eval_locomo_posttrain.sh
 LME_EVAL=$PROJ/scripts/version5/rl/run_eval_longmemeval_posttrain.sh
@@ -45,7 +46,7 @@ for job in "${reserved_jobs[@]}"; do
   scontrol hold "$job"
 done
 
-for gpus in 8 7 6 5 4; do
+for gpus in $GPU_LEVELS; do
   submitted=()
   for i in "${!reserved_jobs[@]}"; do
     [[ -n "${selected_gpus[$i]}" ]] && continue

@@ -33,8 +33,10 @@ MAX_PROMPT_TOKENS=${MAX_PROMPT_TOKENS:-}
 LR=${LR:-5e-6}
 REFERENCE_KL_BETA=${REFERENCE_KL_BETA:-0.05}
 GROUP_SIZE=${GROUP_SIZE:-4}
-# Preserve approximately the original global prompt batch of eight.
-if ((GPUS >= 5)); then DEFAULT_ACCUM=1; else DEFAULT_ACCUM=2; fi
+# Preserve approximately the original global prompt batch of eight when a
+# launch is downshifted.  Nearest-integer accumulation gives 8/7/6 -> 1,
+# 5/4 -> 2, 3 -> 3, and 2 -> 4.
+DEFAULT_ACCUM=$(((8 + GPUS / 2) / GPUS))
 ACCUM=${ACCUM:-$DEFAULT_ACCUM}
 
 case "$MODEL_KIND" in
