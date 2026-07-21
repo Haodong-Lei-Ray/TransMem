@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -147,7 +148,7 @@ class GRPOTrainer(InLoopTrainer):
         len_cl: int,
         len_cq: int,
         temperature: float,
-    ) -> torch.Tensor:
+    ) -> Iterator[torch.Tensor]:
         with rollout.teacher_forced_backward_context(
                 full_ids, len_cl, len_cq, len(answer_ids)) as hidden:
             logits = model.lm_head(hidden).float() / temperature
