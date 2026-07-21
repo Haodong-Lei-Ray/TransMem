@@ -10,12 +10,19 @@ PARTITION=DataFrontier_Explore
 PROBE_SECONDS=${PROBE_SECONDS:-30}
 MAX_STEPS=${MAX_STEPS:-50}
 GPU_LEVELS=${GPU_LEVELS:-"8 7 6 5 4 3 2"}
+TARGET_QUOTATYPE=${TARGET_QUOTATYPE:-spot}
+RETAIN_LAST_PENDING=${RETAIN_LAST_PENDING:-0}
+LAST_GPU_LEVEL=${GPU_LEVELS##* }
+[[ "$TARGET_QUOTATYPE" == "spot" || "$TARGET_QUOTATYPE" == "reserved" ]] || {
+  echo "FATAL: TARGET_QUOTATYPE must be spot or reserved" >&2
+  exit 2
+}
 TRAIN_SCRIPT=$PROJ/scripts/version5/rl/run_train_grpo_memory_d4.sh
 LOCOMO_EVAL=$PROJ/scripts/version5/rl/run_eval_locomo_posttrain.sh
 LME_EVAL=$PROJ/scripts/version5/rl/run_eval_longmemeval_posttrain.sh
 INPUT_MANIFEST=${1:?usage: $0 submission_manifest.tsv}
 STAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_MANIFEST=$PROJ/logs/grpo_memory/submission_spot_${STAMP}.tsv
+OUTPUT_MANIFEST=$PROJ/logs/grpo_memory/submission_${TARGET_QUOTATYPE}_${STAMP}.tsv
 
 declare -a models trains evals reserved_jobs old_eval_jobs runs
 declare -a spot_jobs selected_gpus
@@ -61,13 +68,14 @@ for gpus in $GPU_LEVELS; do
       locomo_train) suffix=lt2lc ;;
       *) echo "FATAL: unknown train=${trains[$i]}" >&2; exit 2 ;;
     esac
-    job=$(sbatch --parsable --quotatype=spot --job-name="e09_s${short}${suffix}" \
+    if [[ "$TARGET_QUOTATYPE" == "spot" ]]; then prefix=s; else prefix=r; fi
+    job=$(sbatch --parsable --quotatype="$TARGET_QUOTATYPE" --job-name="e09_${prefix}${short}${suffix}" \
       --gres="gpu:$gpus" \
       --export="ALL,MODEL_KIND=${models[$i]},TRAIN_KIND=${trains[$i]},RUN_NAME=${runs[$i]},GPUS=$gpus,MAX_STEPS=$MAX_STEPS" \
       "$TRAIN_SCRIPT")
     spot_jobs[$i]=$job
     submitted+=("$i")
-    echo "spot probe run=${runs[$i]} job=$job gpus=$gpus"
+    echo "$TARGET_QUOTATYPE probe run=${runs[$i]} job=$job gpus=$gpus"
   done
 
   ((${#submitted[@]} == 0)) && break
@@ -75,9 +83,10 @@ for gpus in $GPU_LEVELS; do
   for i in "${submitted[@]}"; do
     job=${spot_jobs[$i]}
     state=$(squeue -h -u leihaodong -p "$PARTITION" -j "$job" -o '%T' | head -1 || true)
-    if [[ "$state" == "RUNNING" || "$state" == "CONFIGURING" ]]; then
+    if [[ "$state" == "RUNNING" || "$state" == "CONFIGURING" || \
+          ( "$RETAIN_LAST_PENDING" == "1" && "$gpus" == "$LAST_GPU_LEVEL" && "$state" == "PENDING" ) ]]; then
       selected_gpus[$i]=$gpus
-      echo "spot selected run=${runs[$i]} job=$job gpus=$gpus state=$state"
+      echo "$TARGET_QUOTATYPE selected run=${runs[$i]} job=$job gpus=$gpus state=$state"
     else
       scancel "$job" || true
       spot_jobs[$i]=""
@@ -112,7 +121,7 @@ for i in "${!reserved_jobs[@]}"; do
     scancel "${old_eval_jobs[$i]}" || true
     scancel "${reserved_jobs[$i]}" || true
     train_job=${spot_jobs[$i]}
-    quotatype=spot
+    quotatype=$TARGET_QUOTATYPE
   else
     scontrol release "${reserved_jobs[$i]}"
     train_job=${reserved_jobs[$i]}
@@ -126,7 +135,7 @@ for i in "${!reserved_jobs[@]}"; do
     qwen25_14b:longmemeval) eval_name=e09_e25lm2lc ;;
     qwen25_14b:locomo_train) eval_name=e09_e25lt2lc ;;
   esac
-  if [[ "$quotatype" == "spot" ]]; then
+  if [[ "$train_job" != "${reserved_jobs[$i]}" ]]; then
     eval_job=$(submit_eval "${models[$i]}" "${evals[$i]}" "${runs[$i]}" "$train_job" "$eval_name")
   else
     eval_job=${old_eval_jobs[$i]}
@@ -138,4 +147,4 @@ for i in "${!reserved_jobs[@]}"; do
 done
 
 trap - EXIT
-echo "spot replacement manifest: $OUTPUT_MANIFEST"
+echo "$TARGET_QUOTATYPE replacement manifest: $OUTPUT_MANIFEST"
