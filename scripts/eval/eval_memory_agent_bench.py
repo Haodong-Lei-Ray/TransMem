@@ -656,6 +656,7 @@ class PairedTransMemGreedy:
         from transmem.extract_features import build_chat_prompt_ids, resolve_eos_ids
 
         self.torch = torch
+        self.mode = args.mode
         self.device = torch.device(args.device)
         self.dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
         self.build_chat_prompt_ids = build_chat_prompt_ids
@@ -676,15 +677,22 @@ class PairedTransMemGreedy:
         for parameter in self.model.parameters():
             parameter.requires_grad = False
 
-        checkpoint = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-        config_dict = checkpoint["config"]
-        if isinstance(config_dict, dict) and config_dict.get("layered"):
-            raise ValueError("P1 evaluator expects native TransMem, not a layered checkpoint")
-        self.config = TransMemConfig(**config_dict)
-        self.mem = TransMem(self.config).to(self.device, dtype=self.dtype).eval()
-        self.mem.load_state_dict(checkpoint["model_state_dict"])
         self.eos_ids = set(resolve_eos_ids(self.model))
-        self.checkpoint_step = checkpoint.get("global_step")
+        self.config = None
+        self.mem = None
+        self.checkpoint_step = None
+        if self.mode == "paired":
+            checkpoint = torch.load(
+                args.ckpt, map_location="cpu", weights_only=False)
+            config_dict = checkpoint["config"]
+            if isinstance(config_dict, dict) and config_dict.get("layered"):
+                raise ValueError(
+                    "MAB evaluator expects native TransMem, not a layered checkpoint")
+            self.config = TransMemConfig(**config_dict)
+            self.mem = TransMem(self.config).to(
+                self.device, dtype=self.dtype).eval()
+            self.mem.load_state_dict(checkpoint["model_state_dict"])
+            self.checkpoint_step = checkpoint.get("global_step")
 
     def _prompt(self, context: str, question: str):
         return self.build_chat_prompt_ids(
@@ -774,6 +782,30 @@ class PairedTransMemGreedy:
         transmem = self.tokenizer.decode(transmem_ids, skip_special_tokens=True).strip()
         return student, transmem, len(student_ids), len(transmem_ids)
 
+    def _decode_from_prompt(
+        self, cache, hq_first, hm, prompt_length, max_new_tokens
+    ) -> dict[str, Any]:
+        if self.mode == "paired":
+            student, transmem, student_tokens, transmem_tokens = (
+                self._paired_from_prompt(
+                    cache, hq_first, hm, prompt_length, max_new_tokens))
+            return {
+                "student_prediction": student,
+                "transmem_prediction": transmem,
+                "student_output_tokens": student_tokens,
+                "transmem_output_tokens": transmem_tokens,
+            }
+        try:
+            student_ids = self._student_greedy(
+                cache, hq_first, max_new_tokens)
+        finally:
+            self._crop(cache, prompt_length)
+        return {
+            "student_prediction": self.tokenizer.decode(
+                student_ids, skip_special_tokens=True).strip(),
+            "student_output_tokens": len(student_ids),
+        }
+
     def predict_context(
         self,
         context: str,
@@ -808,19 +840,15 @@ class PairedTransMemGreedy:
                     )
                     cache = output.past_key_values
                     hidden = output.last_hidden_state[0]
-                    hm = self._extract_hm(hidden, context_tokens)
+                    hm = (
+                        self._extract_hm(hidden, context_tokens)
+                        if self.mode == "paired" else None)
                     hq = hidden[-1:, :]
                     prompt_length = int(prompt.shape[1])
-                    student, transmem, student_tokens, transmem_tokens = (
-                        self._paired_from_prompt(
-                            cache, hq, hm, prompt_length, max_new_tokens))
-                    predictions.append({
-                        "student_prediction": student,
-                        "transmem_prediction": transmem,
-                        "student_output_tokens": student_tokens,
-                        "transmem_output_tokens": transmem_tokens,
-                        "prompt_tokens": prompt_length,
-                    })
+                    prediction = self._decode_from_prompt(
+                        cache, hq, hm, prompt_length, max_new_tokens)
+                    prediction["prompt_tokens"] = prompt_length
+                    predictions.append(prediction)
                 return window, predictions
 
             prompt_lists = [_flat_prompt_ids(prompt) for prompt in prompts]
@@ -835,7 +863,9 @@ class PairedTransMemGreedy:
             )
             cache = prefix_output.past_key_values
             prefix_hidden = prefix_output.last_hidden_state[0]
-            hm = self._extract_hm(prefix_hidden, context_tokens)
+            hm = (
+                self._extract_hm(prefix_hidden, context_tokens)
+                if self.mode == "paired" else None)
             prefix_last = prefix_hidden[-1:, :]
             prefix_length = len(prefix_ids)
 
@@ -857,17 +887,13 @@ class PairedTransMemGreedy:
                         hq = suffix_output.last_hidden_state[0, -1:, :]
                     else:
                         hq = prefix_last
-                    student, transmem, student_tokens, transmem_tokens = (
-                        self._paired_from_prompt(
-                            cache, hq, hm, prompt_length, max_new_tokens))
-                    predictions.append({
-                        "student_prediction": student,
-                        "transmem_prediction": transmem,
-                        "student_output_tokens": student_tokens,
-                        "transmem_output_tokens": transmem_tokens,
+                    prediction = self._decode_from_prompt(
+                        cache, hq, hm, prompt_length, max_new_tokens)
+                    prediction.update({
                         "prompt_tokens": prompt_length,
                         "common_prefix_tokens": prefix_length,
                     })
+                    predictions.append(prediction)
                 finally:
                     self._crop(cache, prefix_length)
         return window, predictions
@@ -881,6 +907,20 @@ def _file_fingerprint(path: Path) -> dict[str, Any]:
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+def _checkpoint_fingerprint(
+    path: Path,
+    checkpoint_id: str | None,
+) -> dict[str, Any]:
+    """Identify copied checkpoints without depending on a job-local NVMe path."""
+
+    if checkpoint_id:
+        return {
+            "identity": checkpoint_id,
+            "size": path.stat().st_size,
+        }
+    return _file_fingerprint(path)
 
 
 _MODEL_IDENTITY_FILES = (
@@ -939,7 +979,7 @@ def _model_fingerprint(model_root: Path) -> dict[str, Any]:
 
 
 def _run_id(args: argparse.Namespace) -> str:
-    checkpoint = Path(args.ckpt).resolve()
+    checkpoint = Path(args.ckpt).resolve() if args.ckpt else None
     model_root = Path(args.model_path).resolve()
     data_files = [
         _file_fingerprint(path)
@@ -948,7 +988,10 @@ def _run_id(args: argparse.Namespace) -> str:
     ]
     payload = {
         "model": _model_fingerprint(model_root),
-        "checkpoint": _file_fingerprint(checkpoint),
+        "mode": args.mode,
+        "checkpoint": (
+            _checkpoint_fingerprint(checkpoint, args.checkpoint_id)
+            if checkpoint is not None else None),
         "mab_templates": _file_fingerprint(args.mab_root / "utils" / "templates.py"),
         "mab_metrics": _file_fingerprint(
             args.mab_root / "utils" / "eval_other_utils.py"),
@@ -971,7 +1014,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Paired P1 TransMem/student evaluation on MAB main-13 sources")
     parser.add_argument("--model_path", required=True)
-    parser.add_argument("--ckpt", required=True, help="P1 mix-d4-60ep best.pt")
+    parser.add_argument(
+        "--mode", choices=["paired", "student"], default="paired",
+        help="paired runs student+TransMem; student skips checkpoint loading")
+    parser.add_argument("--ckpt", default=None, help="native TransMem best.pt")
+    parser.add_argument(
+        "--checkpoint_id", default=None,
+        help="Stable checkpoint identity for job-local copies, e.g. an S3 URI")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--mab_root", type=Path, default=DEFAULT_MAB_ROOT)
     parser.add_argument(
@@ -1002,6 +1051,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"not official main sources: {unknown}")
     if args.max_questions_per_source is not None and args.max_questions_per_source < 1:
         parser.error("--max_questions_per_source must be positive")
+    if args.mode == "paired" and not args.ckpt:
+        parser.error("--ckpt is required when --mode=paired")
     return args
 
 
@@ -1074,9 +1125,12 @@ def main() -> None:
                     student_metrics, student_details = score_prediction(
                         prediction["student_prediction"], record.answer, source,
                         post_process, args.mab_root)
-                    transmem_metrics, transmem_details = score_prediction(
-                        prediction["transmem_prediction"], record.answer, source,
-                        post_process, args.mab_root)
+                    transmem_metrics = None
+                    transmem_details = None
+                    if "transmem_prediction" in prediction:
+                        transmem_metrics, transmem_details = score_prediction(
+                            prediction["transmem_prediction"], record.answer, source,
+                            post_process, args.mab_root)
                     result = {
                         "run_id": run_id,
                         "checkpoint_step": runner.checkpoint_step,
@@ -1093,9 +1147,7 @@ def main() -> None:
                         "answer": record.answer,
                         **prediction,
                         "student_metrics": student_metrics,
-                        "transmem_metrics": transmem_metrics,
                         "student_postprocess": student_details,
-                        "transmem_postprocess": transmem_details,
                         "needs_judge": spec.needs_judge,
                         "context_tokens_original": window.original_context_tokens,
                         "context_tokens_kept": window.kept_context_tokens,
@@ -1105,18 +1157,23 @@ def main() -> None:
                         "generation_token_budget": spec.max_new_tokens,
                         "prompt_token_budget": source_prompt_budget(source),
                     }
+                    if transmem_metrics is not None:
+                        result["transmem_metrics"] = transmem_metrics
+                        result["transmem_postprocess"] = transmem_details
                     progress.write(json.dumps(
                         _jsonable(result), ensure_ascii=False) + "\n")
                     progress.flush()
                     done[record.key] = result
                     if printed < args.print_examples:
-                        print(
+                        message = (
                             f"[{source}] {record.key}\n"
                             f"  gold={record.answer!r}\n"
-                            f"  student={prediction['student_prediction'][:160]!r}\n"
-                            f"  transmem={prediction['transmem_prediction'][:160]!r}",
-                            flush=True,
-                        )
+                            f"  student={prediction['student_prediction'][:160]!r}")
+                        if "transmem_prediction" in prediction:
+                            message += (
+                                f"\n  transmem="
+                                f"{prediction['transmem_prediction'][:160]!r}")
+                        print(message, flush=True)
                         printed += 1
 
         ordered = [
@@ -1131,19 +1188,25 @@ def main() -> None:
         if summary_path.is_file():
             with summary_path.open(encoding="utf-8") as handle:
                 previous_summary = json.load(handle)
-        checkpoint_step = resolve_checkpoint_step(
-            runner_step=getattr(runner, "checkpoint_step", None),
-            rows=ordered,
-            previous_summary=previous_summary,
-            run_id=run_id,
-        )
+        checkpoint_step = None
+        if args.mode == "paired":
+            checkpoint_step = resolve_checkpoint_step(
+                runner_step=getattr(runner, "checkpoint_step", None),
+                rows=ordered,
+                previous_summary=previous_summary,
+                run_id=run_id,
+            )
         summary = summarize_source_rows(source, ordered, expected_questions=expected)
         summary.update({
             "run_id": run_id,
             "model_path": str(Path(args.model_path).resolve()),
-            "checkpoint": str(Path(args.ckpt).resolve()),
+            "mode": args.mode,
+            "checkpoint": (
+                str(Path(args.ckpt).resolve()) if args.ckpt else None),
+            "checkpoint_id": args.checkpoint_id,
             "checkpoint_step": checkpoint_step,
-            "decode": "paired_greedy",
+            "decode": (
+                "paired_greedy" if args.mode == "paired" else "student_greedy"),
             "prompt_format": "Project4 build_chat_prompt_ids",
             "agent_input_tokens": AGENT_INPUT_TOKENS,
             "buffer_token_budget": AGENT_BUFFER_TOKENS,
@@ -1158,11 +1221,11 @@ def main() -> None:
         if primary is None:
             print(f"[{source}] complete={summary['complete']} needs_judge=True", flush=True)
         else:
-            print(
-                f"[{source}] {primary}: student={summary['student_primary']} "
-                f"transmem={summary['transmem_primary']} n={summary['num_questions']}",
-                flush=True,
-            )
+            message = (
+                f"[{source}] {primary}: student={summary['student_primary']}")
+            if args.mode == "paired":
+                message += f" transmem={summary['transmem_primary']}"
+            print(f"{message} n={summary['num_questions']}", flush=True)
 
     # Disjoint source jobs share this output root.  The lock makes the rescan and
     # atomic index replacement one transaction, so a late writer cannot publish

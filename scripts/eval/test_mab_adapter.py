@@ -23,6 +23,7 @@ from scripts.eval.eval_memory_agent_bench import (
     AGENT_INPUT_TOKENS,
     MAIN_SOURCE_SPECS,
     PairedTransMemGreedy,
+    _checkpoint_fingerprint,
     _model_fingerprint,
     build_query_records,
     find_split_parquets,
@@ -122,6 +123,7 @@ def tensor_prompt_builder(tokenizer, context, question, device=None):
 def make_fake_paired_runner():
     runner = object.__new__(PairedTransMemGreedy)
     runner.torch = torch
+    runner.mode = "paired"
     runner.device = torch.device("cpu")
     runner.dtype = torch.float32
     runner.tokenizer = FakeTokenizer()
@@ -130,6 +132,14 @@ def make_fake_paired_runner():
     runner.mem = ZeroCorrectionMemory()
     runner.config = types.SimpleNamespace(n_mem=1, hm_mode="floor")
     runner.eos_ids = {127}
+    return runner
+
+
+def make_fake_student_runner():
+    runner = make_fake_paired_runner()
+    runner.mode = "student"
+    runner.mem = None
+    runner.config = None
     return runner
 
 
@@ -274,6 +284,21 @@ def test_prefix_cache_matches_full_prefill_without_cross_policy_or_question_stat
     )
 
 
+def test_student_only_prefix_cache_matches_full_prefill_without_transmem():
+    runner = make_fake_student_runner()
+    questions = ["x", "yz"]
+    _, cached = runner.predict_context(
+        "abcdef", questions, max_new_tokens=3, no_prefix_cache=False)
+    _, plain = runner.predict_context(
+        "abcdef", questions, max_new_tokens=3, no_prefix_cache=True)
+    assert cached == plain or [
+        row["student_prediction"] for row in cached
+    ] == [
+        row["student_prediction"] for row in plain
+    ]
+    assert all("transmem_prediction" not in row for row in cached + plain)
+
+
 def test_query_adapter_indexes_answers_not_the_whole_answer_column():
     row = {
         "context": "memory",
@@ -387,6 +412,26 @@ def test_model_fingerprint_is_stable_across_temporary_mount_paths():
         (second / "config.json").write_text(
             '{"model_type":"other"}', encoding="utf-8")
         assert _model_fingerprint(first) != _model_fingerprint(second)
+
+
+def test_explicit_checkpoint_id_is_stable_across_node_local_copies():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        first = root / "job-1" / "best.pt"
+        second = root / "job-2" / "best.pt"
+        first.parent.mkdir()
+        second.parent.mkdir()
+        first.write_bytes(b"same checkpoint")
+        second.write_bytes(b"same checkpoint")
+        checkpoint_id = (
+            "s3://datafrontier/leihaodong/Project4/checkpoints/run/best.pt")
+
+        assert _checkpoint_fingerprint(first, checkpoint_id) == (
+            _checkpoint_fingerprint(second, checkpoint_id))
+
+        second.write_bytes(b"different-sized checkpoint")
+        assert _checkpoint_fingerprint(first, checkpoint_id) != (
+            _checkpoint_fingerprint(second, checkpoint_id))
     assert resolve_checkpoint_step(
         runner_step=None,
         rows=[],
@@ -454,12 +499,14 @@ def main():
     test_explicit_data_dir_rejects_duplicate_parquet_shards()
     test_common_prefix_is_exact_and_empty_safe()
     test_prefix_cache_matches_full_prefill_without_cross_policy_or_question_state()
+    test_student_only_prefix_cache_matches_full_prefill_without_transmem()
     test_query_adapter_indexes_answers_not_the_whole_answer_column()
     test_icl_label_parser_accepts_benchmark_and_model_forms()
     test_source_summary_has_paired_metrics_and_no_fake_overall()
     test_longmemeval_summary_disallows_cross_domain_claim_without_overlap_audit()
     test_completed_resume_preserves_checkpoint_step_without_runner()
     test_model_fingerprint_is_stable_across_temporary_mount_paths()
+    test_explicit_checkpoint_id_is_stable_across_node_local_copies()
     test_summary_index_waits_for_lock_and_merges_disjoint_source_jobs()
     test_pushd_resolves_redial_relative_path_and_restores_cwd()
     print("test_mab_adapter: PASS")
