@@ -127,6 +127,8 @@ class LayeredConfig:
     gate_mode: str = "constant"
     gate_granularity: str = "token_scalar"
     gate_max: float = 2.0
+    gate_scale: float | None = None
+    gate_shift: float = 0.0
     gate_temperature: float = 1.0
     gate_init: float = 1.0
 
@@ -158,6 +160,11 @@ class LayeredConfig:
         # checkpoints.  A before-mode checkpoint records the opt-in explicitly.
         if not self.transmem_before:
             data.pop("transmem_before")
+        if self.gate_mode == "shifted_sigmoid":
+            data.pop("gate_max")
+        else:
+            data.pop("gate_scale")
+            data.pop("gate_shift")
         if self.gate_mode == "constant":
             for name in (
                 "gate_mode",
@@ -182,7 +189,9 @@ class LayeredConfig:
             final_norm=self.final_norm, zero_init_out=self.zero_init_out,
             a_init=self.a_init, learnable_a=self.learnable_a, warm_start=False,
             gate_mode=self.gate_mode, gate_granularity=self.gate_granularity,
-            gate_max=self.gate_max, gate_temperature=self.gate_temperature,
+            gate_max=self.gate_max, gate_scale=self.gate_scale,
+            gate_shift=self.gate_shift,
+            gate_temperature=self.gate_temperature,
             gate_init=self.gate_init)
 
 

@@ -38,6 +38,63 @@ def test_centered_gate_starts_as_legacy_correction() -> None:
     assert proposal.gate.shape == (batch, queries, 1)
     assert torch.equal(proposal.gate, torch.ones_like(proposal.gate))
     assert torch.allclose(memory.correct(hq, proposal), hq + proposal.ms)
+    assert "gate_shift" not in memory.config.to_dict()
+
+
+def test_shifted_sigmoid_gate_matches_three_sigma_minus_one() -> None:
+    """The signed ablation is opt-in, starts at one, and spans (-1, 2)."""
+    memory = TransMem(_tiny_config(
+        gate_mode="shifted_sigmoid",
+        gate_scale=3.0,
+        gate_shift=-1.0,
+        gate_init=1.0,
+    ))
+    assert memory.gate_proj is not None
+    hidden = torch.randn(2, 3, memory.dim)
+    ms = torch.randn_like(hidden)
+
+    initial = memory._read_gate(hidden, ms)
+    assert torch.allclose(initial, torch.ones_like(initial), atol=1e-6)
+
+    with torch.no_grad():
+        memory.gate_proj.weight.zero_()
+        memory.gate_proj.bias.zero_()
+    midpoint = memory._read_gate(hidden, ms)
+    assert torch.equal(midpoint, torch.full_like(midpoint, 0.5))
+
+    with torch.no_grad():
+        memory.gate_proj.weight.normal_(0.0, 0.2)
+        memory.gate_proj.bias.fill_(-0.3)
+    logits = memory.gate_proj(hidden) / memory.config.gate_temperature
+    expected = 3.0 * torch.sigmoid(logits) - 1.0
+    actual = memory._read_gate(hidden, ms)
+    assert torch.equal(actual, expected)
+    assert bool(((actual > -1.0) & (actual < 2.0)).all())
+    assert memory.config.to_dict()["gate_shift"] == -1.0
+
+    from transmem.layered import LayeredConfig
+    layered_config = LayeredConfig(
+        dim=64,
+        block_depth=1,
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=16,
+        intermediate_size=128,
+        max_position_embeddings=512,
+        attn_impl="eager",
+        gate_mode="shifted_sigmoid",
+        gate_scale=3.0,
+        gate_shift=-1.0,
+        gate_init=1.0,
+        inject_layers=[5],
+    )
+    block_config = layered_config.block_config()
+    assert block_config.gate_mode == "shifted_sigmoid"
+    assert block_config.gate_scale == 3.0
+    assert block_config.gate_shift == -1.0
+    assert "gate_max" not in layered_config.to_dict()
+    assert layered_config.to_dict()["gate_scale"] == 3.0
+    assert layered_config.to_dict()["gate_shift"] == -1.0
 
 
 def test_constant_mode_keeps_legacy_parameters_and_scale() -> None:

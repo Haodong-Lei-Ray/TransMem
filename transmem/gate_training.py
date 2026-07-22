@@ -204,6 +204,7 @@ def gate_metrics(
         "gate_p10": float(quantiles[0]),
         "gate_p50": float(quantiles[1]),
         "gate_p90": float(quantiles[2]),
+        "gate_frac_lt_0": float((gate_values < 0.0).float().mean()),
         "gate_frac_lt_025": float((gate_values < 0.25).float().mean()),
         "gate_frac_gt_175": float((gate_values > 1.75).float().mean()),
         "ms_norm": float(ms_norm.mean()),

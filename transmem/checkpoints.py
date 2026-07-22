@@ -17,6 +17,8 @@ _GATE_CONFIG_FIELDS = {
     "gate_mode",
     "gate_granularity",
     "gate_max",
+    "gate_scale",
+    "gate_shift",
     "gate_temperature",
     "gate_init",
 }

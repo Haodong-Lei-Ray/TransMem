@@ -95,14 +95,17 @@ class TransMemConfig:
     warm_start: bool = False       # 是否热启动(权重在 build 后由训练脚本拷入)
 
     # ── 动态 gate (旧 config 缺字段时保持 constant 严格兼容) ──────────
-    gate_mode: str = "constant"   # constant | centered_sigmoid | sigmoid
+    # constant | centered_sigmoid | shifted_sigmoid | sigmoid
+    gate_mode: str = "constant"
     gate_granularity: str = "token_scalar"
     gate_max: float = 2.0
+    gate_scale: float | None = None
+    gate_shift: float = 0.0
     gate_temperature: float = 1.0
     gate_init: float = 1.0
 
     def __post_init__(self) -> None:
-        modes = ("constant", "centered_sigmoid", "sigmoid")
+        modes = ("constant", "centered_sigmoid", "shifted_sigmoid", "sigmoid")
         if self.gate_mode not in modes:
             raise ValueError(f"gate_mode 必须是 {modes}, 得到 {self.gate_mode!r}")
         if self.gate_granularity != "token_scalar":
@@ -111,13 +114,30 @@ class TransMemConfig:
                 f"得到 {self.gate_granularity!r}")
         if self.gate_temperature <= 0:
             raise ValueError("gate_temperature 必须 > 0")
-        if self.gate_max <= 0:
+        if self.gate_mode != "shifted_sigmoid" and self.gate_max <= 0:
             raise ValueError("gate_max 必须 > 0")
+        if self.gate_mode == "shifted_sigmoid" and (
+                self.gate_scale is None or self.gate_scale <= 0):
+            raise ValueError("shifted_sigmoid 要求 gate_scale > 0")
+        if self.gate_mode != "shifted_sigmoid" and self.gate_scale is not None:
+            raise ValueError(
+                "gate_scale 仅用于 shifted_sigmoid；其他模式必须省略")
+        if self.gate_mode != "shifted_sigmoid" and self.gate_shift != 0.0:
+            raise ValueError(
+                "gate_shift 仅用于 shifted_sigmoid；其他模式必须为 0")
         if self.gate_mode == "centered_sigmoid" and not (
                 0.0 < self.gate_init < self.gate_max):
             raise ValueError(
                 "centered_sigmoid 要求 0 < gate_init < gate_max, "
                 f"得到 {self.gate_init} / {self.gate_max}")
+        if self.gate_mode == "shifted_sigmoid" and not (
+                self.gate_shift < self.gate_init
+                < self.gate_shift + float(self.gate_scale)):
+            raise ValueError(
+                "shifted_sigmoid 要求 gate_shift < gate_init < "
+                "gate_shift + gate_scale, 得到 "
+                f"{self.gate_shift} < {self.gate_init} < "
+                f"{self.gate_shift + float(self.gate_scale)}")
         if self.gate_mode == "sigmoid" and not (0.0 < self.gate_init < 1.0):
             raise ValueError(
                 "sigmoid 要求 0 < gate_init < 1; 推荐 0.9, "
@@ -139,6 +159,11 @@ class TransMemConfig:
     def to_dict(self) -> dict:
         from dataclasses import asdict
         data = asdict(self)
+        if self.gate_mode == "shifted_sigmoid":
+            data.pop("gate_max")
+        else:
+            data.pop("gate_scale")
+            data.pop("gate_shift")
         if self.gate_mode == "constant":
             for name in (
                 "gate_mode",
@@ -225,8 +250,15 @@ class TransMem(nn.Module):
             nn.init.normal_(self.out_proj.weight, mean=0.0, std=std)
         if self.gate_proj is not None:
             nn.init.zeros_(self.gate_proj.weight)
-            if self.config.gate_mode == "centered_sigmoid":
-                ratio = self.config.gate_init / self.config.gate_max
+            if self.config.gate_mode in {
+                    "centered_sigmoid", "shifted_sigmoid"}:
+                scale = (
+                    float(self.config.gate_scale)
+                    if self.config.gate_mode == "shifted_sigmoid"
+                    else self.config.gate_max)
+                ratio = (
+                    (self.config.gate_init - self.config.gate_shift)
+                    / scale)
             else:
                 ratio = self.config.gate_init
             bias = self.config.gate_temperature * torch.logit(
@@ -247,8 +279,14 @@ class TransMem(nn.Module):
         if self.gate_proj is None:
             return torch.ones(*ms.shape[:-1], 1, dtype=ms.dtype, device=ms.device)
         logits = self.gate_proj(hidden) / self.config.gate_temperature
-        if self.config.gate_mode == "centered_sigmoid":
-            return self.config.gate_max * torch.sigmoid(logits)
+        if self.config.gate_mode in {"centered_sigmoid", "shifted_sigmoid"}:
+            scale = (
+                float(self.config.gate_scale)
+                if self.config.gate_mode == "shifted_sigmoid"
+                else self.config.gate_max)
+            return (
+                scale * torch.sigmoid(logits)
+                + self.config.gate_shift)
         return torch.sigmoid(logits)
 
     # ── 前向: X -> (MS, gate) ─────────────────────────────────────────
