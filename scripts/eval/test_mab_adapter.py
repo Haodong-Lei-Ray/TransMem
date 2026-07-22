@@ -124,6 +124,8 @@ def make_fake_paired_runner():
     runner = object.__new__(PairedTransMemGreedy)
     runner.torch = torch
     runner.mode = "paired"
+    runner.layered = False
+    runner.layered_rollout = None
     runner.device = torch.device("cpu")
     runner.dtype = torch.float32
     runner.tokenizer = FakeTokenizer()
@@ -140,6 +142,19 @@ def make_fake_student_runner():
     runner.mode = "student"
     runner.mem = None
     runner.config = None
+    return runner
+
+
+class FakeLayeredRollout:
+    def student_rollout(self, memory, context, question, max_new, **kwargs):
+        del memory, context, question, max_new, kwargs
+        return None, None, [90]
+
+
+def make_fake_layered_runner():
+    runner = make_fake_paired_runner()
+    runner.layered = True
+    runner.layered_rollout = FakeLayeredRollout()
     return runner
 
 
@@ -297,6 +312,15 @@ def test_student_only_prefix_cache_matches_full_prefill_without_transmem():
         row["student_prediction"] for row in plain
     ]
     assert all("transmem_prediction" not in row for row in cached + plain)
+
+
+def test_layered_transmem_adds_predictions_after_shared_student_prefill():
+    runner = make_fake_layered_runner()
+    _, rows = runner.predict_context(
+        "abcdef", ["x", "yz"], max_new_tokens=3, no_prefix_cache=False)
+    assert [row["transmem_prediction"] for row in rows] == ["Z", "Z"]
+    assert [row["transmem_output_tokens"] for row in rows] == [1, 1]
+    assert all("student_prediction" in row for row in rows)
 
 
 def test_query_adapter_indexes_answers_not_the_whole_answer_column():
@@ -500,6 +524,7 @@ def main():
     test_common_prefix_is_exact_and_empty_safe()
     test_prefix_cache_matches_full_prefill_without_cross_policy_or_question_state()
     test_student_only_prefix_cache_matches_full_prefill_without_transmem()
+    test_layered_transmem_adds_predictions_after_shared_student_prefill()
     test_query_adapter_indexes_answers_not_the_whole_answer_column()
     test_icl_label_parser_accepts_benchmark_and_model_forms()
     test_source_summary_has_paired_metrics_and_no_fake_overall()

@@ -680,17 +680,27 @@ class PairedTransMemGreedy:
         self.eos_ids = set(resolve_eos_ids(self.model))
         self.config = None
         self.mem = None
+        self.layered = False
+        self.layered_rollout = None
         self.checkpoint_step = None
         if self.mode == "paired":
             checkpoint = torch.load(
                 args.ckpt, map_location="cpu", weights_only=False)
             config_dict = checkpoint["config"]
             if isinstance(config_dict, dict) and config_dict.get("layered"):
-                raise ValueError(
-                    "MAB evaluator expects native TransMem, not a layered checkpoint")
-            self.config = TransMemConfig(**config_dict)
-            self.mem = TransMem(self.config).to(
-                self.device, dtype=self.dtype).eval()
+                from transmem.layered import (
+                    LayeredConfig, LayeredRollout, TransMemLayered)
+
+                self.layered = True
+                self.config = LayeredConfig.from_dict(config_dict)
+                self.mem = TransMemLayered(self.config).to(
+                    self.device, dtype=self.dtype).eval()
+                self.layered_rollout = LayeredRollout(
+                    self.model, self.tokenizer, self.device, self.mem, self.dtype)
+            else:
+                self.config = TransMemConfig(**config_dict)
+                self.mem = TransMem(self.config).to(
+                    self.device, dtype=self.dtype).eval()
             self.mem.load_state_dict(checkpoint["model_state_dict"])
             self.checkpoint_step = checkpoint.get("global_step")
 
@@ -785,7 +795,7 @@ class PairedTransMemGreedy:
     def _decode_from_prompt(
         self, cache, hq_first, hm, prompt_length, max_new_tokens
     ) -> dict[str, Any]:
-        if self.mode == "paired":
+        if self.mode == "paired" and not self.layered:
             student, transmem, student_tokens, transmem_tokens = (
                 self._paired_from_prompt(
                     cache, hq_first, hm, prompt_length, max_new_tokens))
@@ -805,6 +815,33 @@ class PairedTransMemGreedy:
                 student_ids, skip_special_tokens=True).strip(),
             "student_output_tokens": len(student_ids),
         }
+
+    def _add_layered_predictions(
+        self,
+        context: str,
+        questions: Sequence[str],
+        predictions: list[dict[str, Any]],
+        max_new_tokens: int,
+    ) -> list[dict[str, Any]]:
+        if not self.layered:
+            return predictions
+        if self.layered_rollout is None:
+            raise AssertionError("layered checkpoint has no LayeredRollout")
+        for question, prediction in zip(questions, predictions):
+            _, _, answer_ids = self.layered_rollout.student_rollout(
+                self.mem,
+                context,
+                question,
+                max_new_tokens,
+                sample=False,
+                temperature=1.0,
+            )
+            prediction.update({
+                "transmem_prediction": self.tokenizer.decode(
+                    answer_ids, skip_special_tokens=True).strip(),
+                "transmem_output_tokens": len(answer_ids),
+            })
+        return predictions
 
     def predict_context(
         self,
@@ -842,14 +879,19 @@ class PairedTransMemGreedy:
                     hidden = output.last_hidden_state[0]
                     hm = (
                         self._extract_hm(hidden, context_tokens)
-                        if self.mode == "paired" else None)
+                        if self.mode == "paired" and not self.layered else None)
                     hq = hidden[-1:, :]
                     prompt_length = int(prompt.shape[1])
                     prediction = self._decode_from_prompt(
                         cache, hq, hm, prompt_length, max_new_tokens)
                     prediction["prompt_tokens"] = prompt_length
                     predictions.append(prediction)
-                return window, predictions
+                if self.layered:
+                    del cache, output, hidden, hq, hm
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                return window, self._add_layered_predictions(
+                    window.context, questions, predictions, max_new_tokens)
 
             prompt_lists = [_flat_prompt_ids(prompt) for prompt in prompts]
             prefix_ids = longest_common_prefix(prompt_lists)
@@ -865,9 +907,10 @@ class PairedTransMemGreedy:
             prefix_hidden = prefix_output.last_hidden_state[0]
             hm = (
                 self._extract_hm(prefix_hidden, context_tokens)
-                if self.mode == "paired" else None)
+                if self.mode == "paired" and not self.layered else None)
             prefix_last = prefix_hidden[-1:, :]
             prefix_length = len(prefix_ids)
+            suffix_output = None
 
             for prompt_ids in prompt_lists:
                 suffix_ids = prompt_ids[prefix_length:]
@@ -896,7 +939,12 @@ class PairedTransMemGreedy:
                     predictions.append(prediction)
                 finally:
                     self._crop(cache, prefix_length)
-        return window, predictions
+        if self.layered:
+            del cache, prefix_output, prefix_hidden, prefix_last, hm, hq, suffix_output
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return window, self._add_layered_predictions(
+            window.context, questions, predictions, max_new_tokens)
 
 
 def _file_fingerprint(path: Path) -> dict[str, Any]:
