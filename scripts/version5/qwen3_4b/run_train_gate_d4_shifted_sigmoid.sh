@@ -16,6 +16,10 @@
 # and checkpoints remain byte/behavior compatible.
 set -euo pipefail
 
+echo "=== allocated GPU capacity before shifted-gate training ==="
+nvidia-smi --query-gpu=index,name,memory.total,memory.free \
+  --format=csv || true
+
 PROJ=/mnt/petrelfs/leihaodong/Project4
 export D=4
 export GPUS=${GPUS:-8}
