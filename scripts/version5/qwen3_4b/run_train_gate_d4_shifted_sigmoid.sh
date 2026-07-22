@@ -3,6 +3,7 @@
 #SBATCH -p DataFrontier_Explore
 #SBATCH -N 1
 #SBATCH --gres=gpu:8
+#SBATCH --mem=256G
 #SBATCH --quotatype=spot
 #SBATCH --requeue
 #SBATCH -t 48:00:00
