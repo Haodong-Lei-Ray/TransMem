@@ -18,5 +18,6 @@ export S3_CKPT_REL=leihaodong/Project4/checkpoints/v5_gate_qwen25_14b_scratch_jo
 export CHECKPOINT_ID=s3://datafrontier/$S3_CKPT_REL
 export OUT_ROOT=${OUT_ROOT:-$PROJ/eval_results/mab_qwen25_14b_dynamic_gate_d4}
 export WORKERS_PER_GPU=${WORKERS_PER_GPU:-1}
+export AGENT_INPUT_TOKENS=${AGENT_INPUT_TOKENS:-30000}
 
 exec bash "$PROJ/scripts/eval/Qwen3-4B-Instruct-2507/run_eval_memory_agent_bench_parallel.sh"

@@ -197,6 +197,7 @@ def test_source_prompt_budget_reserves_official_buffer_and_generation():
             + AGENT_BUFFER_TOKENS
             == AGENT_INPUT_TOKENS
         )
+    assert source_prompt_budget("ruler_qa1_197K", 30_000) == 25_950
 
 
 def test_context_window_uses_longest_query_for_every_question():
@@ -386,11 +387,26 @@ def test_source_summary_has_paired_metrics_and_no_fake_overall():
         "icl_banking77_5900shot_balance", rows, expected_questions=100)
     assert summary["num_questions"] == 2
     assert summary["expected_questions"] == 100
+    assert summary["requested_questions"] == 100
+    assert summary["capped"] is False
+    assert summary["requested_complete"] is False
     assert summary["complete"] is False
     assert summary["student"]["exact_match"] == 0.5
     assert summary["transmem"]["f1"] == 0.5
     assert summary["context_tokens"]["left_truncated_total"] == 8
     assert "overall" not in summary
+
+
+def test_capped_summary_is_only_request_complete_not_officially_complete():
+    rows = [{"student_metrics": {}, "transmem_metrics": {}}] * 2
+    summary = summarize_source_rows(
+        "eventqa_full", rows, expected_questions=2)
+    assert summary["num_questions"] == 2
+    assert summary["expected_questions"] == 500
+    assert summary["requested_questions"] == 2
+    assert summary["capped"] is True
+    assert summary["requested_complete"] is True
+    assert summary["complete"] is False
 
 
 def test_longmemeval_summary_disallows_cross_domain_claim_without_overlap_audit():
@@ -453,7 +469,7 @@ def test_explicit_checkpoint_id_is_stable_across_node_local_copies():
         assert _checkpoint_fingerprint(first, checkpoint_id) == (
             _checkpoint_fingerprint(second, checkpoint_id))
 
-        second.write_bytes(b"different-sized checkpoint")
+        second.write_bytes(b"other checkpoint")
         assert _checkpoint_fingerprint(first, checkpoint_id) != (
             _checkpoint_fingerprint(second, checkpoint_id))
     assert resolve_checkpoint_step(

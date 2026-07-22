@@ -27,8 +27,10 @@ VENV=$PROJ/.venv-transmem
 PY=("$UV" run --python "$VENV/bin/python" python)
 cd "$PROJ"
 
-CKPT=${CKPT:-$PROJ/checkpoints/offpolicy_v3_p1_lmehqa_d4e60_forward_kl/best.pt}
-S3_CKPT_REL=${S3_CKPT_REL:-leihaodong/Project4/checkpoints/offpolicy_v3_p1_lmehqa_d4e60_forward_kl/best.pt}
+DEFAULT_LOCAL_CKPT=$PROJ/checkpoints/offpolicy_v3_p1_lmehqa_d4e60_forward_kl/best.pt
+DEFAULT_S3_CKPT_REL=leihaodong/Project4/checkpoints/offpolicy_v3_p1_lmehqa_d4e60_forward_kl/best.pt
+CKPT=${CKPT:-}
+S3_CKPT_REL=${S3_CKPT_REL:-}
 CHECKPOINT_ID=${CHECKPOINT_ID:-}
 MODE=${MODE:-paired}
 MODEL_NAME=${MODEL_NAME:-${ModelName:-Qwen/Qwen3-4B-Instruct-2507}}
@@ -40,6 +42,21 @@ ATTN=${ATTN:-sdpa}
 NO_PREFIX_CACHE=${NO_PREFIX_CACHE:-0}
 FORCE=${FORCE:-0}
 WORKERS_PER_GPU=${WORKERS_PER_GPU:-1}
+AGENT_INPUT_TOKENS=${AGENT_INPUT_TOKENS:-128000}
+
+if [[ "$MODE" == paired ]]; then
+  if [[ -n "$CKPT" && -n "$S3_CKPT_REL" ]]; then
+    echo "FATAL: set exactly one of CKPT or S3_CKPT_REL for paired evaluation" >&2
+    exit 2
+  fi
+  if [[ -z "$CKPT" && -z "$S3_CKPT_REL" ]]; then
+    if [[ -f "$DEFAULT_LOCAL_CKPT" ]]; then
+      CKPT=$DEFAULT_LOCAL_CKPT
+    else
+      S3_CKPT_REL=$DEFAULT_S3_CKPT_REL
+    fi
+  fi
+fi
 
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "$CUDA_VISIBLE_DEVICES" != "NoDevFiles" ]]; then
   IFS=',' read -r -a VISIBLE_GPUS <<< "$CUDA_VISIBLE_DEVICES"
@@ -101,16 +118,20 @@ sleep 20
 MODEL_PATH=${MODEL_PATH:-$MOUNT_POINT/leihaodong/$MODEL_NAME}
 [[ -f "$MODEL_PATH/config.json" ]] || { echo "FATAL: missing model: $MODEL_PATH" >&2; exit 1; }
 [[ -d "$MAB_ROOT" ]] || { echo "FATAL: missing MAB root: $MAB_ROOT" >&2; exit 1; }
-if [[ "$MODE" == paired && ! -f "$CKPT" ]]; then
+if [[ "$MODE" == paired && -n "$S3_CKPT_REL" ]]; then
   S3_CKPT=$MOUNT_POINT/$S3_CKPT_REL
   [[ -f "$S3_CKPT" ]] || {
-    echo "FATAL: paired checkpoint missing locally ($CKPT) and on S3 ($S3_CKPT_REL)" >&2
+    echo "FATAL: paired checkpoint missing on S3: $S3_CKPT_REL" >&2
     exit 1
   }
   CKPT=$LOCAL_CKPT_DIR/$(basename "$S3_CKPT")
   echo "Copy paired checkpoint from S3 to node-local NVMe: $S3_CKPT_REL"
   cp "$S3_CKPT" "$CKPT"
   CHECKPOINT_ID=${CHECKPOINT_ID:-s3://datafrontier/$S3_CKPT_REL}
+fi
+if [[ "$MODE" == paired && ! -f "$CKPT" ]]; then
+  echo "FATAL: paired checkpoint missing locally: $CKPT" >&2
+  exit 1
 fi
 
 PLAN_ARGS=(--workers "$WORKERS" --sources "${ALL_SOURCES[@]}" --format tsv)
@@ -127,6 +148,7 @@ for line in "${PLAN_LINES[@]}"; do
   ARGS=(
     --model_path "$MODEL_PATH" --mode "$MODE" --mab_root "$MAB_ROOT"
     --output_dir "$OUT_ROOT" --attn_impl "$ATTN" --device cuda:0
+    --agent_input_tokens "$AGENT_INPUT_TOKENS"
     --sources "${worker_sources[@]}"
   )
   if [[ "$MODE" == paired ]]; then
@@ -150,17 +172,22 @@ if ((status != 0)); then
   exit 1
 fi
 
-"${PY[@]}" - "$OUT_ROOT/summary.json" "${ALL_SOURCES[@]}" <<'PY'
+"${PY[@]}" - "$OUT_ROOT/summary.json" "$MAXQ" "${ALL_SOURCES[@]}" <<'PY'
 import json
 import sys
 
-summary_path, *expected = sys.argv[1:]
+summary_path, max_questions, *expected = sys.argv[1:]
 with open(summary_path, encoding="utf-8") as handle:
     summary = json.load(handle)
 actual = summary.get("sources", {})
 missing = [source for source in expected if source not in actual]
-incomplete = [source for source in expected if not actual.get(source, {}).get("complete")]
+completion_key = "requested_complete" if max_questions else "complete"
+incomplete = [
+    source for source in expected
+    if not actual.get(source, {}).get(completion_key)
+]
 if missing or incomplete:
     raise SystemExit(f"incomplete MAB merge: missing={missing}, incomplete={incomplete}")
-print(f"MemoryAgentBench evaluation complete: sources={len(expected)} output={summary_path}")
+scope = "capped smoke" if max_questions else "full evaluation"
+print(f"MemoryAgentBench {scope} complete: sources={len(expected)} output={summary_path}")
 PY

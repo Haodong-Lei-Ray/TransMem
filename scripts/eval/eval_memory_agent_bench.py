@@ -81,14 +81,17 @@ MAIN_SOURCE_SPECS: dict[str, SourceSpec] = {
 }
 
 
-def source_prompt_budget(source: str) -> int:
-    """Return the official Qwen prompt budget for one MAB source."""
+def source_prompt_budget(
+    source: str,
+    agent_input_tokens: int = AGENT_INPUT_TOKENS,
+) -> int:
+    """Return the prompt budget for one MAB source and model context cap."""
 
     try:
         generation_tokens = MAIN_SOURCE_SPECS[source].max_new_tokens
     except KeyError as exc:
         raise ValueError(f"unknown MemoryAgentBench source: {source}") from exc
-    budget = AGENT_INPUT_TOKENS - AGENT_BUFFER_TOKENS - generation_tokens
+    budget = agent_input_tokens - AGENT_BUFFER_TOKENS - generation_tokens
     if budget <= 0:
         raise ValueError(
             f"{source} has no prompt budget after reserving "
@@ -401,14 +404,19 @@ def summarize_source_rows(
     """Aggregate a single source only; never invent a cross-source overall."""
 
     spec = MAIN_SOURCE_SPECS[source]
-    expected = spec.question_count if expected_questions is None else expected_questions
+    requested = (
+        spec.question_count if expected_questions is None else expected_questions)
+    official = spec.question_count
     original = sum(int(row.get("context_tokens_original", 0)) for row in rows)
     kept = sum(int(row.get("context_tokens_kept", 0)) for row in rows)
     summary: dict[str, Any] = {
         "source": source,
         "num_questions": len(rows),
-        "expected_questions": expected,
-        "complete": len(rows) == expected,
+        "expected_questions": official,
+        "requested_questions": requested,
+        "capped": requested < official,
+        "requested_complete": len(rows) == requested,
+        "complete": len(rows) == official,
         "primary_metric": spec.primary_metric,
         "needs_judge": spec.needs_judge,
         "student": _mean_metrics(rows, "student_metrics"),
@@ -966,7 +974,7 @@ def _checkpoint_fingerprint(
     if checkpoint_id:
         return {
             "identity": checkpoint_id,
-            "size": path.stat().st_size,
+            **_content_fingerprint(path),
         }
     return _file_fingerprint(path)
 
@@ -1047,7 +1055,7 @@ def _run_id(args: argparse.Namespace) -> str:
         "source_specs": {
             source: spec.__dict__ for source, spec in MAIN_SOURCE_SPECS.items()
         },
-        "agent_input_tokens": AGENT_INPUT_TOKENS,
+        "agent_input_tokens": args.agent_input_tokens,
         "agent_buffer_tokens": AGENT_BUFFER_TOKENS,
         "prefix_cache": not args.no_prefix_cache,
         "max_questions_per_source": args.max_questions_per_source,
@@ -1081,6 +1089,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_questions_per_source", type=int, default=None,
         help="Smoke-test cap; default evaluates each source's full official question set")
+    parser.add_argument(
+        "--agent_input_tokens", type=int, default=AGENT_INPUT_TOKENS,
+        help="Model-specific total input ceiling before buffer/generation reserves")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument(
@@ -1099,6 +1110,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"not official main sources: {unknown}")
     if args.max_questions_per_source is not None and args.max_questions_per_source < 1:
         parser.error("--max_questions_per_source must be positive")
+    if args.agent_input_tokens <= AGENT_BUFFER_TOKENS:
+        parser.error("--agent_input_tokens must exceed the agent buffer")
     if args.mode == "paired" and not args.ckpt:
         parser.error("--ckpt is required when --mode=paired")
     return args
@@ -1167,7 +1180,8 @@ def main() -> None:
                     args.no_prefix_cache,
                     window_questions=[
                         record.formatted_query for record in records],
-                    max_prompt_tokens=source_prompt_budget(source),
+                    max_prompt_tokens=source_prompt_budget(
+                        source, args.agent_input_tokens),
                 )
                 for record, prediction in zip(missing, paired):
                     student_metrics, student_details = score_prediction(
@@ -1200,10 +1214,11 @@ def main() -> None:
                         "context_tokens_original": window.original_context_tokens,
                         "context_tokens_kept": window.kept_context_tokens,
                         "context_tokens_left_truncated": window.left_truncated_tokens,
-                        "agent_input_tokens": AGENT_INPUT_TOKENS,
+                        "agent_input_tokens": args.agent_input_tokens,
                         "buffer_token_budget": AGENT_BUFFER_TOKENS,
                         "generation_token_budget": spec.max_new_tokens,
-                        "prompt_token_budget": source_prompt_budget(source),
+                        "prompt_token_budget": source_prompt_budget(
+                            source, args.agent_input_tokens),
                     }
                     if transmem_metrics is not None:
                         result["transmem_metrics"] = transmem_metrics
@@ -1256,10 +1271,11 @@ def main() -> None:
             "decode": (
                 "paired_greedy" if args.mode == "paired" else "student_greedy"),
             "prompt_format": "Project4 build_chat_prompt_ids",
-            "agent_input_tokens": AGENT_INPUT_TOKENS,
+            "agent_input_tokens": args.agent_input_tokens,
             "buffer_token_budget": AGENT_BUFFER_TOKENS,
             "generation_token_budget": spec.max_new_tokens,
-            "prompt_token_budget": source_prompt_budget(source),
+            "prompt_token_budget": source_prompt_budget(
+                source, args.agent_input_tokens),
             "prefix_cache": not args.no_prefix_cache,
             "progress_jsonl": str(progress_path.resolve()),
         })
