@@ -770,30 +770,23 @@ class PairedTransMemGreedy:
 
                 self.layered = True
                 self.config = LayeredConfig.from_dict(config_dict)
-                self.trained_n_mem = self.config.n_mem
-                if args.N is not None:
-                    if self.config.pos_mode == "learned":
-                        raise ValueError(
-                            "inference-time --N override is unsupported for "
-                            "pos_mode=learned because it changes positional "
-                            "embedding semantics and shape")
-                    self.config.n_mem = args.N
-                self.eval_n_mem = self.config.n_mem
+            else:
+                self.config = TransMemConfig(**config_dict)
+            self.trained_n_mem = self.config.n_mem
+            if args.N is not None:
+                if self.config.pos_mode == "learned":
+                    raise ValueError(
+                        "inference-time --N override is unsupported for "
+                        "pos_mode=learned because it changes positional "
+                        "embedding semantics and shape")
+                self.config.n_mem = args.N
+            self.eval_n_mem = self.config.n_mem
+            if self.layered:
                 self.mem = TransMemLayered(self.config).to(
                     self.device, dtype=self.dtype).eval()
                 self.layered_rollout = LayeredRollout(
                     self.model, self.tokenizer, self.device, self.mem, self.dtype)
             else:
-                self.config = TransMemConfig(**config_dict)
-                self.trained_n_mem = self.config.n_mem
-                if args.N is not None:
-                    if self.config.pos_mode == "learned":
-                        raise ValueError(
-                            "inference-time --N override is unsupported for "
-                            "pos_mode=learned because it changes positional "
-                            "embedding semantics and shape")
-                    self.config.n_mem = args.N
-                self.eval_n_mem = self.config.n_mem
                 self.mem = TransMem(self.config).to(
                     self.device, dtype=self.dtype).eval()
             self.mem.load_state_dict(checkpoint["model_state_dict"])

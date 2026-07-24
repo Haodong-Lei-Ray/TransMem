@@ -353,7 +353,10 @@ class LayeredRollout:
             raise ValueError(
                 f"overflow prompt 长度 {context_ids.shape[1]} 超出模型上限 "
                 f"{model_limit}")
-        positions = hm_positions(len_cl, self.n_mem, self.hm_mode)
+        # Overflow chunks are a new inference-only representation, so use an
+        # exhaustive N-way split even for legacy ``hm_mode=floor`` checkpoints:
+        # frac guarantees that the final slot is the chunk's final token.
+        positions = hm_positions(len_cl, self.n_mem, "frac")
         if positions[-1] >= context_ids.shape[1]:
             raise ValueError(
                 f"HM 位置 {positions[-1]} 超出输入长度 {context_ids.shape[1]} "

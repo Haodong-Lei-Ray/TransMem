@@ -39,10 +39,11 @@ def test_capture_memory_from_ids_returns_each_injection_layers_slots():
         for handle in handles:
             handle.remove()
 
-    indices = torch.tensor(hm_positions(len_cl, cfg.n_mem, cfg.hm_mode))
+    indices = torch.tensor(hm_positions(len_cl, cfg.n_mem, "frac"))
     assert set(memory) == set(inject)
     for layer_idx in inject:
         assert torch.allclose(memory[layer_idx], raw[layer_idx][0, indices])
+    assert int(indices[-1]) == len_cl - 1
 
 
 def test_capture_memory_from_context_prefills_raw_context_only():
