@@ -43,6 +43,9 @@ NO_PREFIX_CACHE=${NO_PREFIX_CACHE:-0}
 FORCE=${FORCE:-0}
 WORKERS_PER_GPU=${WORKERS_PER_GPU:-1}
 AGENT_INPUT_TOKENS=${AGENT_INPUT_TOKENS:-128000}
+N=${N:-}
+RETAIN_OVERFLOW_HM=${RETAIN_OVERFLOW_HM:-0}
+OVERFLOW_CHUNK_TOKENS=${OVERFLOW_CHUNK_TOKENS:-250000}
 
 if [[ "$MODE" == paired ]]; then
   if [[ -n "$CKPT" && -n "$S3_CKPT_REL" ]]; then
@@ -72,6 +75,18 @@ if ((GPU_COUNT < 1 || GPU_COUNT > ${#VISIBLE_GPUS[@]})); then
 fi
 if ((WORKERS_PER_GPU < 1)); then
   echo "FATAL: WORKERS_PER_GPU must be positive" >&2
+  exit 2
+fi
+if [[ "$RETAIN_OVERFLOW_HM" != 0 && "$RETAIN_OVERFLOW_HM" != 1 ]]; then
+  echo "FATAL: RETAIN_OVERFLOW_HM must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$RETAIN_OVERFLOW_HM" == 1 && "$MODE" != paired ]]; then
+  echo "FATAL: RETAIN_OVERFLOW_HM=1 requires MODE=paired" >&2
+  exit 2
+fi
+if ((OVERFLOW_CHUNK_TOKENS < 1)); then
+  echo "FATAL: OVERFLOW_CHUNK_TOKENS must be positive" >&2
   exit 2
 fi
 WORKERS=${WORKERS:-$((GPU_COUNT * WORKERS_PER_GPU))}
@@ -137,7 +152,7 @@ fi
 PLAN_ARGS=(--workers "$WORKERS" --sources "${ALL_SOURCES[@]}" --format tsv)
 [[ -n "$MAXQ" ]] && PLAN_ARGS+=(--max_questions_per_source "$MAXQ")
 mapfile -t PLAN_LINES < <("${PY[@]}" -m scripts.eval.plan_mab_parallel "${PLAN_ARGS[@]}")
-echo "MemoryAgentBench parallel eval: mode=$MODE model=$MODEL_NAME gpus=$GPU_COUNT workers=${#PLAN_LINES[@]} workers_per_gpu=$WORKERS_PER_GPU output=$OUT_ROOT"
+echo "MemoryAgentBench parallel eval: mode=$MODE model=$MODEL_NAME trained_n_mem=checkpoint eval_n_mem=${N:-checkpoint} retain_overflow_hm=$RETAIN_OVERFLOW_HM overflow_chunk_tokens=$OVERFLOW_CHUNK_TOKENS gpus=$GPU_COUNT workers=${#PLAN_LINES[@]} workers_per_gpu=$WORKERS_PER_GPU output=$OUT_ROOT"
 
 for line in "${PLAN_LINES[@]}"; do
   IFS=$'\t' read -r worker question_count source_text <<< "$line"
@@ -154,6 +169,13 @@ for line in "${PLAN_LINES[@]}"; do
   if [[ "$MODE" == paired ]]; then
     ARGS+=(--ckpt "$CKPT")
     [[ -n "$CHECKPOINT_ID" ]] && ARGS+=(--checkpoint_id "$CHECKPOINT_ID")
+    [[ -n "$N" ]] && ARGS+=(--N "$N")
+    if [[ "$RETAIN_OVERFLOW_HM" == 1 ]]; then
+      ARGS+=(
+        --retain_overflow_hm
+        --overflow_chunk_tokens "$OVERFLOW_CHUNK_TOKENS"
+      )
+    fi
   fi
   [[ -n "$MAXQ" ]] && ARGS+=(--max_questions_per_source "$MAXQ")
   [[ "$NO_PREFIX_CACHE" == 1 ]] && ARGS+=(--no_prefix_cache)

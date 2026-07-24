@@ -28,6 +28,7 @@ import json
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Mapping
 
 import torch
 import torch.nn as nn
@@ -322,12 +323,138 @@ class LayeredRollout:
         assert layered.top_layer < n_layers, (
             f"inject_layers 最大 {layered.top_layer} 超出 LLM 层数 {n_layers}")
 
+    @torch.no_grad()
+    def capture_memory_from_ids(
+        self,
+        context_ids: torch.Tensor,
+        len_cl: int,
+    ) -> dict[int, torch.Tensor]:
+        """Prefill one independent context chunk and retain N HM per layer.
+
+        This is the long-context overflow seam.  It deliberately runs the
+        frozen student without TransMem injection and without an LLM KV cache,
+        so different overflow chunks cannot leak cache state into one another.
+        The returned tensors are ordered exactly like ``inject_layers`` and
+        use the checkpoint's historical HM-position convention.
+        """
+        from .extract_features import hm_positions
+
+        if context_ids.ndim != 2 or context_ids.shape[0] != 1:
+            raise ValueError(
+                f"context_ids 必须是 [1,T]，收到 {tuple(context_ids.shape)}")
+        if len_cl < 1:
+            raise ValueError(f"len_cl 必须为正数，收到 {len_cl}")
+        model_limit = int(getattr(
+            self.model.config,
+            "max_position_embeddings",
+            context_ids.shape[1],
+        ))
+        if context_ids.shape[1] > model_limit:
+            raise ValueError(
+                f"overflow prompt 长度 {context_ids.shape[1]} 超出模型上限 "
+                f"{model_limit}")
+        positions = hm_positions(len_cl, self.n_mem, self.hm_mode)
+        if positions[-1] >= context_ids.shape[1]:
+            raise ValueError(
+                f"HM 位置 {positions[-1]} 超出输入长度 {context_ids.shape[1]} "
+                f"(len_cl={len_cl})")
+        index = torch.tensor(
+            positions, device=context_ids.device, dtype=torch.long)
+        mem_dtype = next(self.layered.parameters()).dtype
+        captured: dict[int, torch.Tensor] = {}
+
+        def mk_hook(layer_idx: int):
+            def hook(_module, inputs, output):
+                target = output[0] if isinstance(output, tuple) else output
+                source = (
+                    inputs[0]
+                    if self.layered.config.transmem_before
+                    else target
+                )
+                captured[layer_idx] = (
+                    source[0].index_select(0, index).detach().to(mem_dtype))
+
+            return hook
+
+        handles = [
+            self.model.model.layers[layer].register_forward_hook(mk_hook(layer))
+            for layer in self.layered.inject_layers
+        ]
+        try:
+            output = self.model.model(
+                input_ids=context_ids,
+                attention_mask=torch.ones_like(context_ids),
+                use_cache=False,
+            )
+            missing = set(self.layered.inject_layers) - set(captured)
+            if missing:
+                raise RuntimeError(
+                    f"overflow prefill hooks 未捕获层: {sorted(missing)}")
+            return {
+                layer: captured[layer]
+                for layer in self.layered.inject_layers
+            }
+        finally:
+            for handle in handles:
+                handle.remove()
+            if "output" in locals():
+                del output
+
+    @torch.no_grad()
+    def capture_memory_from_context(
+        self,
+        context: str,
+    ) -> dict[int, torch.Tensor]:
+        """Render and prefill one overflow context, with no real question."""
+        from .extract_features import build_chat_prompt_ids
+
+        context_ids = build_chat_prompt_ids(
+            self.tok, context, "", self.device, thinking=False)
+        len_cl = self.tok(
+            context,
+            return_tensors="pt",
+            add_special_tokens=False,
+        ).input_ids.shape[1]
+        return self.capture_memory_from_ids(context_ids, len_cl)
+
+    def _normalize_overflow_memory(
+        self,
+        overflow_memory: Mapping[int, torch.Tensor] | None,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[int, torch.Tensor]:
+        """Validate a complete per-layer overflow-memory bundle."""
+        if overflow_memory is None:
+            return {}
+        expected = set(self.layered.inject_layers)
+        actual = set(overflow_memory)
+        if actual != expected:
+            raise ValueError(
+                "overflow_memory 层集合必须与 inject_layers 完全一致: "
+                f"expected={sorted(expected)}, actual={sorted(actual)}")
+        normalized: dict[int, torch.Tensor] = {}
+        for layer in self.layered.inject_layers:
+            memory = overflow_memory[layer]
+            if memory.ndim != 2 or memory.shape[1] != self.layered.config.dim:
+                raise ValueError(
+                    f"overflow_memory[{layer}] 必须是 [K*N,{self.layered.config.dim}]，"
+                    f"收到 {tuple(memory.shape)}")
+            normalized[layer] = memory.detach().to(device=device, dtype=dtype)
+        slot_counts = {memory.shape[0] for memory in normalized.values()}
+        if len(slot_counts) != 1:
+            raise ValueError(
+                "所有注入层的 overflow memory 槽数必须一致，收到 "
+                f"{sorted(slot_counts)}")
+        return normalized
+
     # ── 可测试核心: 纯 token-id 入口 (CPU 测试不依赖 tokenizer) ─────────
     @torch.no_grad()
     def generate_from_ids(self, cq_ids: torch.Tensor, len_cl: int, max_new: int,
                           sample: bool = False, temperature: float = 1.0,
                           collect_gate_diagnostics: bool = False,
-                          return_log_probs: bool = False):
+                          return_log_probs: bool = False,
+                          overflow_memory: Mapping[int, torch.Tensor] | None = None):
         """Generate answer ids, optionally returning behavior-policy log-probs.
 
         The default remains the historical ``list[int]`` return.  GRPO opts in
@@ -340,6 +467,8 @@ class LayeredRollout:
         hm_idx = hm_positions(len_cl, self.n_mem, self.hm_mode)
         hm_idx_t = torch.tensor(hm_idx, device=cq_ids.device, dtype=torch.long)
         mem_dtype = next(self.layered.parameters()).dtype
+        retained_overflow = self._normalize_overflow_memory(
+            overflow_memory, device=cq_ids.device, dtype=mem_dtype)
 
         state: dict[int, DynamicCache] = {}
         phase = {"mode": "prefill"}
@@ -356,7 +485,12 @@ class LayeredRollout:
                 source = (_inp[0] if self.layered.config.transmem_before
                           else target)                               # H^(l-1) or H^l
                 if phase["mode"] == "prefill":
-                    hm = source[0, hm_idx_t, :]                     # [N, dim]
+                    hm_limit = source[0, hm_idx_t, :]               # [N, dim]
+                    hm = (
+                        torch.cat(
+                            [retained_overflow[layer_idx], hm_limit], dim=0)
+                        if retained_overflow else hm_limit
+                    )                                               # [(K+1)N, dim]
                     hq_source = source[:, -1, :]                    # [1, dim]
                     cache = state[layer_idx] = DynamicCache()
                     X = torch.cat(
@@ -551,7 +685,8 @@ class LayeredRollout:
                         max_new: int, sample: bool = False, temperature: float = 1.0,
                         collect_gate_diagnostics: bool = False,
                         thinking: bool = False,
-                        max_prompt_tokens: int | None = None):
+                        max_prompt_tokens: int | None = None,
+                        overflow_memory: Mapping[int, torch.Tensor] | None = None):
         from .extract_features import (
             build_chat_prompt_ids, fit_context_to_prompt_budget)
         context_long = fit_context_to_prompt_budget(
@@ -562,5 +697,6 @@ class LayeredRollout:
                           add_special_tokens=False).input_ids.shape[1]
         ans_ids = self.generate_from_ids(cq_ids, len_cl, max_new,
                                          sample=sample, temperature=temperature,
-                                         collect_gate_diagnostics=collect_gate_diagnostics)
+                                         collect_gate_diagnostics=collect_gate_diagnostics,
+                                         overflow_memory=overflow_memory)
         return None, None, ans_ids

@@ -123,6 +123,8 @@ class ContextWindow:
     kept_context_tokens: int
     left_truncated_tokens: int
     prompt_lengths: tuple[int, ...]
+    overflow_chunks: tuple[str, ...] = ()
+    overflow_chunk_tokens: tuple[int, ...] = ()
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -234,12 +236,57 @@ def _flat_prompt_ids(value: Any) -> list[int]:
     return [int(item) for item in value]
 
 
+def _decode_ids(tokenizer: Any, token_ids: Sequence[int]) -> str:
+    """Decode without whitespace cleanup when the tokenizer supports it."""
+
+    try:
+        return tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        return tokenizer.decode(list(token_ids), skip_special_tokens=False)
+
+
+def _decode_overflow_chunks(
+    tokenizer: Any,
+    token_ids: Sequence[int],
+    max_chunk_tokens: int,
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """Split one discarded token prefix into independently prefillable chunks."""
+
+    if max_chunk_tokens < 1:
+        raise ValueError("overflow_chunk_tokens must be positive")
+    chunks: list[str] = []
+    lengths: list[int] = []
+    start = 0
+    while start < len(token_ids):
+        end = min(start + max_chunk_tokens, len(token_ids))
+        text = _decode_ids(tokenizer, token_ids[start:end])
+        encoded_length = len(_encode(tokenizer, text))
+        # Decode/re-encode boundaries may expand by a token. Tighten until the
+        # actual standalone chunk obeys the requested model-input budget.
+        while encoded_length > max_chunk_tokens and end > start + 1:
+            end -= max(1, encoded_length - max_chunk_tokens)
+            text = _decode_ids(tokenizer, token_ids[start:end])
+            encoded_length = len(_encode(tokenizer, text))
+        if encoded_length > max_chunk_tokens:
+            raise ValueError(
+                "one decoded overflow token exceeds overflow_chunk_tokens")
+        chunks.append(text)
+        lengths.append(encoded_length)
+        start = end
+    return tuple(chunks), tuple(lengths)
+
+
 def plan_context_window(
     tokenizer: Any,
     context: str,
     questions: Sequence[str],
     prompt_builder: Callable[..., Any],
     max_prompt_tokens: int = MAX_PROMPT_TOKENS,
+    overflow_chunk_tokens: int | None = None,
 ) -> ContextWindow:
     """Choose one left-truncated context suffix for all questions in a context.
 
@@ -264,7 +311,7 @@ def plan_context_window(
 
     # Usually one pass.  The loop handles BPE boundary re-tokenization exactly.
     while True:
-        candidate = tokenizer.decode(candidate_ids, skip_special_tokens=False)
+        candidate = _decode_ids(tokenizer, candidate_ids)
         prompt_lengths = tuple(
             len(_flat_prompt_ids(
                 prompt_builder(tokenizer, candidate, question, device=None)))
@@ -280,12 +327,20 @@ def plan_context_window(
         candidate_ids = candidate_ids[drop:]
 
     kept_tokens = len(_encode(tokenizer, candidate))
+    overflow_chunks: tuple[str, ...] = ()
+    overflow_lengths: tuple[int, ...] = ()
+    if overflow_chunk_tokens is not None:
+        dropped = len(original_ids) - len(candidate_ids)
+        overflow_chunks, overflow_lengths = _decode_overflow_chunks(
+            tokenizer, original_ids[:dropped], overflow_chunk_tokens)
     return ContextWindow(
         context=candidate,
         original_context_tokens=len(original_ids),
         kept_context_tokens=kept_tokens,
         left_truncated_tokens=max(len(original_ids) - kept_tokens, 0),
         prompt_lengths=prompt_lengths,
+        overflow_chunks=overflow_chunks,
+        overflow_chunk_tokens=overflow_lengths,
     )
 
 
@@ -668,6 +723,11 @@ class PairedTransMemGreedy:
         self.device = torch.device(args.device)
         self.dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
         self.build_chat_prompt_ids = build_chat_prompt_ids
+        self.retain_overflow_hm = bool(args.retain_overflow_hm)
+        self.overflow_chunk_tokens = (
+            int(args.overflow_chunk_tokens)
+            if self.retain_overflow_hm else None
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(
             args.model_path, local_files_only=True, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
@@ -691,6 +751,8 @@ class PairedTransMemGreedy:
         self.layered = False
         self.layered_rollout = None
         self.checkpoint_step = None
+        self.trained_n_mem = None
+        self.eval_n_mem = None
         if self.mode == "paired":
             checkpoint = torch.load(
                 args.ckpt, map_location="cpu", weights_only=False)
@@ -701,16 +763,50 @@ class PairedTransMemGreedy:
 
                 self.layered = True
                 self.config = LayeredConfig.from_dict(config_dict)
+                self.trained_n_mem = self.config.n_mem
+                if args.N is not None:
+                    if self.config.pos_mode == "learned":
+                        raise ValueError(
+                            "inference-time --N override is unsupported for "
+                            "pos_mode=learned because it changes positional "
+                            "embedding semantics and shape")
+                    self.config.n_mem = args.N
+                self.eval_n_mem = self.config.n_mem
                 self.mem = TransMemLayered(self.config).to(
                     self.device, dtype=self.dtype).eval()
                 self.layered_rollout = LayeredRollout(
                     self.model, self.tokenizer, self.device, self.mem, self.dtype)
             else:
                 self.config = TransMemConfig(**config_dict)
+                self.trained_n_mem = self.config.n_mem
+                if args.N is not None:
+                    if self.config.pos_mode == "learned":
+                        raise ValueError(
+                            "inference-time --N override is unsupported for "
+                            "pos_mode=learned because it changes positional "
+                            "embedding semantics and shape")
+                    self.config.n_mem = args.N
+                self.eval_n_mem = self.config.n_mem
                 self.mem = TransMem(self.config).to(
                     self.device, dtype=self.dtype).eval()
             self.mem.load_state_dict(checkpoint["model_state_dict"])
             self.checkpoint_step = checkpoint.get("global_step")
+        if self.retain_overflow_hm:
+            if self.mode != "paired" or not self.layered:
+                raise ValueError(
+                    "--retain_overflow_hm currently requires a layered paired "
+                    "TransMem checkpoint")
+            empty_prompt_tokens = int(self._prompt("", "").shape[1])
+            model_limit = int(getattr(
+                self.model.config,
+                "max_position_embeddings",
+                self.tokenizer.model_max_length,
+            ))
+            if self.overflow_chunk_tokens + empty_prompt_tokens > model_limit:
+                raise ValueError(
+                    "--overflow_chunk_tokens plus chat-template overhead exceeds "
+                    f"the model window: {self.overflow_chunk_tokens} + "
+                    f"{empty_prompt_tokens} > {model_limit}")
 
     def _prompt(self, context: str, question: str):
         return self.build_chat_prompt_ids(
@@ -728,6 +824,10 @@ class PairedTransMemGreedy:
             questions,
             self.build_chat_prompt_ids,
             max_prompt_tokens,
+            overflow_chunk_tokens=(
+                self.overflow_chunk_tokens
+                if getattr(self, "retain_overflow_hm", False) else None
+            ),
         )
 
     def _extract_hm(self, hidden, context_tokens: int):
@@ -826,7 +926,7 @@ class PairedTransMemGreedy:
 
     def _add_layered_predictions(
         self,
-        context: str,
+        window: ContextWindow,
         questions: Sequence[str],
         predictions: list[dict[str, Any]],
         max_new_tokens: int,
@@ -835,19 +935,47 @@ class PairedTransMemGreedy:
             return predictions
         if self.layered_rollout is None:
             raise AssertionError("layered checkpoint has no LayeredRollout")
+        overflow_memory = None
+        if getattr(self, "retain_overflow_hm", False) and window.overflow_chunks:
+            per_layer: dict[int, list[Any]] = defaultdict(list)
+            for chunk in window.overflow_chunks:
+                chunk_memory = (
+                    self.layered_rollout.capture_memory_from_context(chunk))
+                for layer, memory in chunk_memory.items():
+                    per_layer[layer].append(memory)
+                del chunk_memory
+            overflow_memory = {
+                layer: self.torch.cat(parts, dim=0)
+                for layer, parts in per_layer.items()
+            }
+            if self.torch.cuda.is_available():
+                self.torch.cuda.empty_cache()
+        overflow_chunks = len(window.overflow_chunks)
+        limit_slots = int(
+            getattr(self, "eval_n_mem", None) or self.config.n_mem)
+        overflow_slots = overflow_chunks * limit_slots
         for question, prediction in zip(questions, predictions):
             _, _, answer_ids = self.layered_rollout.student_rollout(
                 self.mem,
-                context,
+                window.context,
                 question,
                 max_new_tokens,
                 sample=False,
                 temperature=1.0,
+                overflow_memory=overflow_memory,
             )
             prediction.update({
                 "transmem_prediction": self.tokenizer.decode(
                     answer_ids, skip_special_tokens=True).strip(),
                 "transmem_output_tokens": len(answer_ids),
+                "transmem_overflow_retention": bool(
+                    getattr(self, "retain_overflow_hm", False)),
+                "transmem_overflow_chunks": overflow_chunks,
+                "transmem_overflow_chunk_tokens": list(
+                    window.overflow_chunk_tokens),
+                "transmem_overflow_memory_slots": overflow_slots,
+                "transmem_limit_memory_slots": limit_slots,
+                "transmem_effective_memory_slots": overflow_slots + limit_slots,
             })
         return predictions
 
@@ -899,7 +1027,7 @@ class PairedTransMemGreedy:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 return window, self._add_layered_predictions(
-                    window.context, questions, predictions, max_new_tokens)
+                    window, questions, predictions, max_new_tokens)
 
             prompt_lists = [_flat_prompt_ids(prompt) for prompt in prompts]
             prefix_ids = longest_common_prefix(prompt_lists)
@@ -952,7 +1080,7 @@ class PairedTransMemGreedy:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         return window, self._add_layered_predictions(
-            window.context, questions, predictions, max_new_tokens)
+            window, questions, predictions, max_new_tokens)
 
 
 def _file_fingerprint(path: Path) -> dict[str, Any]:
@@ -1048,6 +1176,10 @@ def _run_id(args: argparse.Namespace) -> str:
         "checkpoint": (
             _checkpoint_fingerprint(checkpoint, args.checkpoint_id)
             if checkpoint is not None else None),
+        "n_mem_override": args.N,
+        "retain_overflow_hm": args.retain_overflow_hm,
+        "overflow_chunk_tokens": (
+            args.overflow_chunk_tokens if args.retain_overflow_hm else None),
         "mab_templates": _file_fingerprint(args.mab_root / "utils" / "templates.py"),
         "mab_metrics": _file_fingerprint(
             args.mab_root / "utils" / "eval_other_utils.py"),
@@ -1077,6 +1209,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint_id", default=None,
         help="Stable checkpoint identity for job-local copies, e.g. an S3 URI")
+    parser.add_argument(
+        "--N", type=int, default=None,
+        help="Inference-only memory-slot override. Default uses checkpoint n_mem.")
+    parser.add_argument(
+        "--retain_overflow_hm", action="store_true",
+        help="Layered TransMem only: independently prefill every left-truncated "
+             "context chunk and prepend its per-layer HM to the retained suffix HM.")
+    parser.add_argument(
+        "--overflow_chunk_tokens", type=int, default=250_000,
+        help="Maximum raw context tokens per independent overflow prefill. "
+             "Only used with --retain_overflow_hm.")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--mab_root", type=Path, default=DEFAULT_MAB_ROOT)
     parser.add_argument(
@@ -1114,6 +1257,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--agent_input_tokens must exceed the agent buffer")
     if args.mode == "paired" and not args.ckpt:
         parser.error("--ckpt is required when --mode=paired")
+    if args.N is not None and args.N < 1:
+        parser.error("--N must be positive")
+    if args.mode == "student" and args.N is not None:
+        parser.error("--N only applies when --mode=paired")
+    if args.overflow_chunk_tokens < 1:
+        parser.error("--overflow_chunk_tokens must be positive")
+    if args.mode == "student" and args.retain_overflow_hm:
+        parser.error("--retain_overflow_hm requires --mode=paired")
     return args
 
 
@@ -1196,6 +1347,8 @@ def main() -> None:
                     result = {
                         "run_id": run_id,
                         "checkpoint_step": runner.checkpoint_step,
+                        "trained_n_mem": runner.trained_n_mem,
+                        "eval_n_mem": runner.eval_n_mem,
                         "key": record.key,
                         "source": source,
                         "context_index": record.context_index,
@@ -1214,6 +1367,10 @@ def main() -> None:
                         "context_tokens_original": window.original_context_tokens,
                         "context_tokens_kept": window.kept_context_tokens,
                         "context_tokens_left_truncated": window.left_truncated_tokens,
+                        "context_overflow_chunk_count": len(
+                            window.overflow_chunks),
+                        "context_overflow_chunk_tokens": list(
+                            window.overflow_chunk_tokens),
                         "agent_input_tokens": args.agent_input_tokens,
                         "buffer_token_budget": AGENT_BUFFER_TOKENS,
                         "generation_token_budget": spec.max_new_tokens,
@@ -1268,6 +1425,14 @@ def main() -> None:
                 str(Path(args.ckpt).resolve()) if args.ckpt else None),
             "checkpoint_id": args.checkpoint_id,
             "checkpoint_step": checkpoint_step,
+            "trained_n_mem": (
+                getattr(runner, "trained_n_mem", None)
+                if runner is not None else (
+                    ordered[0].get("trained_n_mem") if ordered else None)),
+            "eval_n_mem": (
+                getattr(runner, "eval_n_mem", None)
+                if runner is not None else (
+                    ordered[0].get("eval_n_mem") if ordered else None)),
             "decode": (
                 "paired_greedy" if args.mode == "paired" else "student_greedy"),
             "prompt_format": "Project4 build_chat_prompt_ids",
@@ -1277,6 +1442,10 @@ def main() -> None:
             "prompt_token_budget": source_prompt_budget(
                 source, args.agent_input_tokens),
             "prefix_cache": not args.no_prefix_cache,
+            "retain_overflow_hm": args.retain_overflow_hm,
+            "overflow_chunk_tokens": (
+                args.overflow_chunk_tokens
+                if args.retain_overflow_hm else None),
             "progress_jsonl": str(progress_path.resolve()),
         })
         _write_json(summary_path, summary)

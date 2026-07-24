@@ -146,8 +146,18 @@ def make_fake_student_runner():
 
 
 class FakeLayeredRollout:
+    def __init__(self):
+        self.capture_calls = []
+        self.rollout_overflow = []
+
+    def capture_memory_from_context(self, context):
+        self.capture_calls.append(context)
+        value = float(len(self.capture_calls))
+        return {4: torch.tensor([[value]])}
+
     def student_rollout(self, memory, context, question, max_new, **kwargs):
-        del memory, context, question, max_new, kwargs
+        del memory, context, question, max_new
+        self.rollout_overflow.append(kwargs.get("overflow_memory"))
         return None, None, [90]
 
 
@@ -155,6 +165,8 @@ def make_fake_layered_runner():
     runner = make_fake_paired_runner()
     runner.layered = True
     runner.layered_rollout = FakeLayeredRollout()
+    runner.retain_overflow_hm = False
+    runner.overflow_chunk_tokens = None
     return runner
 
 
@@ -215,6 +227,21 @@ def test_context_window_uses_longest_query_for_every_question():
     assert plan.kept_context_tokens == 5
     assert plan.left_truncated_tokens == 5
     assert plan.prompt_lengths == (9, 12)
+
+
+def test_context_window_retains_every_overflow_chunk_in_order():
+    plan = plan_context_window(
+        FakeTokenizer(),
+        context="abcdefghij",
+        questions=["x", "wxyz"],
+        prompt_builder=fake_prompt_builder,
+        max_prompt_tokens=12,
+        overflow_chunk_tokens=3,
+    )
+    assert plan.context == "fghij"
+    assert plan.overflow_chunks == ("abc", "de")
+    assert plan.overflow_chunk_tokens == (3, 2)
+    assert plan.left_truncated_tokens == 5
 
 
 def test_parquet_discovery_rejects_multiple_cached_revisions():
@@ -322,6 +349,27 @@ def test_layered_transmem_adds_predictions_after_shared_student_prefill():
     assert [row["transmem_prediction"] for row in rows] == ["Z", "Z"]
     assert [row["transmem_output_tokens"] for row in rows] == [1, 1]
     assert all("student_prediction" in row for row in rows)
+
+
+def test_layered_overflow_memory_is_captured_once_and_reused_for_questions():
+    runner = make_fake_layered_runner()
+    runner.retain_overflow_hm = True
+    runner.overflow_chunk_tokens = 3
+    window, rows = runner.predict_context(
+        "abcdefghij",
+        ["x", "wxyz"],
+        max_new_tokens=3,
+        no_prefix_cache=False,
+        max_prompt_tokens=12,
+    )
+
+    assert window.overflow_chunks == ("abc", "de")
+    assert runner.layered_rollout.capture_calls == ["abc", "de"]
+    first, second = runner.layered_rollout.rollout_overflow
+    assert first is second
+    assert torch.equal(first[4], torch.tensor([[1.0], [2.0]]))
+    assert all(row["transmem_overflow_chunks"] == 2 for row in rows)
+    assert all(row["transmem_effective_memory_slots"] == 3 for row in rows)
 
 
 def test_query_adapter_indexes_answers_not_the_whole_answer_column():
@@ -535,12 +583,14 @@ def main():
     test_main_source_manifest_matches_official_main_experiment()
     test_source_prompt_budget_reserves_official_buffer_and_generation()
     test_context_window_uses_longest_query_for_every_question()
+    test_context_window_retains_every_overflow_chunk_in_order()
     test_parquet_discovery_rejects_multiple_cached_revisions()
     test_explicit_data_dir_rejects_duplicate_parquet_shards()
     test_common_prefix_is_exact_and_empty_safe()
     test_prefix_cache_matches_full_prefill_without_cross_policy_or_question_state()
     test_student_only_prefix_cache_matches_full_prefill_without_transmem()
     test_layered_transmem_adds_predictions_after_shared_student_prefill()
+    test_layered_overflow_memory_is_captured_once_and_reused_for_questions()
     test_query_adapter_indexes_answers_not_the_whole_answer_column()
     test_icl_label_parser_accepts_benchmark_and_model_forms()
     test_source_summary_has_paired_metrics_and_no_fake_overall()
