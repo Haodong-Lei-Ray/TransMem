@@ -115,16 +115,23 @@ class QueryRecord:
 
 
 @dataclass(frozen=True)
+class OverflowChunk:
+    """One independently prefilled prefix chunk and its standalone token count."""
+
+    text: str
+    token_count: int
+
+
+@dataclass(frozen=True)
 class ContextWindow:
-    """One shared context suffix and the resulting prompt lengths."""
+    """One shared context suffix and any independently retained prefix chunks."""
 
     context: str
     original_context_tokens: int
     kept_context_tokens: int
     left_truncated_tokens: int
     prompt_lengths: tuple[int, ...]
-    overflow_chunks: tuple[str, ...] = ()
-    overflow_chunk_tokens: tuple[int, ...] = ()
+    overflow_chunks: tuple[OverflowChunk, ...] = ()
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -253,13 +260,12 @@ def _decode_overflow_chunks(
     tokenizer: Any,
     token_ids: Sequence[int],
     max_chunk_tokens: int,
-) -> tuple[tuple[str, ...], tuple[int, ...]]:
+) -> tuple[OverflowChunk, ...]:
     """Split one discarded token prefix into independently prefillable chunks."""
 
     if max_chunk_tokens < 1:
         raise ValueError("overflow_chunk_tokens must be positive")
-    chunks: list[str] = []
-    lengths: list[int] = []
+    chunks: list[OverflowChunk] = []
     start = 0
     while start < len(token_ids):
         end = min(start + max_chunk_tokens, len(token_ids))
@@ -274,10 +280,9 @@ def _decode_overflow_chunks(
         if encoded_length > max_chunk_tokens:
             raise ValueError(
                 "one decoded overflow token exceeds overflow_chunk_tokens")
-        chunks.append(text)
-        lengths.append(encoded_length)
+        chunks.append(OverflowChunk(text=text, token_count=encoded_length))
         start = end
-    return tuple(chunks), tuple(lengths)
+    return tuple(chunks)
 
 
 def plan_context_window(
@@ -311,7 +316,11 @@ def plan_context_window(
 
     # Usually one pass.  The loop handles BPE boundary re-tokenization exactly.
     while True:
-        candidate = _decode_ids(tokenizer, candidate_ids)
+        candidate = (
+            _decode_ids(tokenizer, candidate_ids)
+            if overflow_chunk_tokens is not None
+            else tokenizer.decode(candidate_ids, skip_special_tokens=False)
+        )
         prompt_lengths = tuple(
             len(_flat_prompt_ids(
                 prompt_builder(tokenizer, candidate, question, device=None)))
@@ -327,11 +336,10 @@ def plan_context_window(
         candidate_ids = candidate_ids[drop:]
 
     kept_tokens = len(_encode(tokenizer, candidate))
-    overflow_chunks: tuple[str, ...] = ()
-    overflow_lengths: tuple[int, ...] = ()
+    overflow_chunks: tuple[OverflowChunk, ...] = ()
     if overflow_chunk_tokens is not None:
         dropped = len(original_ids) - len(candidate_ids)
-        overflow_chunks, overflow_lengths = _decode_overflow_chunks(
+        overflow_chunks = _decode_overflow_chunks(
             tokenizer, original_ids[:dropped], overflow_chunk_tokens)
     return ContextWindow(
         context=candidate,
@@ -340,7 +348,6 @@ def plan_context_window(
         left_truncated_tokens=max(len(original_ids) - kept_tokens, 0),
         prompt_lengths=prompt_lengths,
         overflow_chunks=overflow_chunks,
-        overflow_chunk_tokens=overflow_lengths,
     )
 
 
@@ -796,17 +803,15 @@ class PairedTransMemGreedy:
                 raise ValueError(
                     "--retain_overflow_hm currently requires a layered paired "
                     "TransMem checkpoint")
-            empty_prompt_tokens = int(self._prompt("", "").shape[1])
             model_limit = int(getattr(
                 self.model.config,
                 "max_position_embeddings",
                 self.tokenizer.model_max_length,
             ))
-            if self.overflow_chunk_tokens + empty_prompt_tokens > model_limit:
+            if self.overflow_chunk_tokens > model_limit:
                 raise ValueError(
-                    "--overflow_chunk_tokens plus chat-template overhead exceeds "
-                    f"the model window: {self.overflow_chunk_tokens} + "
-                    f"{empty_prompt_tokens} > {model_limit}")
+                    "--overflow_chunk_tokens exceeds the model window: "
+                    f"{self.overflow_chunk_tokens} > {model_limit}")
 
     def _prompt(self, context: str, question: str):
         return self.build_chat_prompt_ids(
@@ -940,7 +945,7 @@ class PairedTransMemGreedy:
             per_layer: dict[int, list[Any]] = defaultdict(list)
             for chunk in window.overflow_chunks:
                 chunk_memory = (
-                    self.layered_rollout.capture_memory_from_context(chunk))
+                    self.layered_rollout.capture_memory_from_context(chunk.text))
                 for layer, memory in chunk_memory.items():
                     per_layer[layer].append(memory)
                 del chunk_memory
@@ -971,8 +976,8 @@ class PairedTransMemGreedy:
                 "transmem_overflow_retention": bool(
                     getattr(self, "retain_overflow_hm", False)),
                 "transmem_overflow_chunks": overflow_chunks,
-                "transmem_overflow_chunk_tokens": list(
-                    window.overflow_chunk_tokens),
+                "transmem_overflow_chunk_tokens": [
+                    chunk.token_count for chunk in window.overflow_chunks],
                 "transmem_overflow_memory_slots": overflow_slots,
                 "transmem_limit_memory_slots": limit_slots,
                 "transmem_effective_memory_slots": overflow_slots + limit_slots,
@@ -1369,8 +1374,8 @@ def main() -> None:
                         "context_tokens_left_truncated": window.left_truncated_tokens,
                         "context_overflow_chunk_count": len(
                             window.overflow_chunks),
-                        "context_overflow_chunk_tokens": list(
-                            window.overflow_chunk_tokens),
+                        "context_overflow_chunk_tokens": [
+                            chunk.token_count for chunk in window.overflow_chunks],
                         "agent_input_tokens": args.agent_input_tokens,
                         "buffer_token_budget": AGENT_BUFFER_TOKENS,
                         "generation_token_budget": spec.max_new_tokens,

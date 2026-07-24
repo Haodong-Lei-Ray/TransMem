@@ -405,17 +405,14 @@ class LayeredRollout:
         self,
         context: str,
     ) -> dict[int, torch.Tensor]:
-        """Render and prefill one overflow context, with no real question."""
-        from .extract_features import build_chat_prompt_ids
-
-        context_ids = build_chat_prompt_ids(
-            self.tok, context, "", self.device, thinking=False)
-        len_cl = self.tok(
+        """Tokenize and prefill exactly one raw overflow context chunk."""
+        context_ids = self.tok(
             context,
             return_tensors="pt",
             add_special_tokens=False,
-        ).input_ids.shape[1]
-        return self.capture_memory_from_ids(context_ids, len_cl)
+        ).input_ids.to(self.device)
+        return self.capture_memory_from_ids(
+            context_ids, len_cl=context_ids.shape[1])
 
     def _normalize_overflow_memory(
         self,

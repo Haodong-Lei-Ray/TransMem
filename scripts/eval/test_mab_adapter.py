@@ -51,6 +51,20 @@ class FakeTokenizer:
         return "".join(chr(item) for item in ids)
 
 
+class CleanupTrackingTokenizer(FakeTokenizer):
+    def __init__(self):
+        self.cleanup_values = []
+
+    def decode(
+        self,
+        ids,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=None,
+    ):
+        self.cleanup_values.append(clean_up_tokenization_spaces)
+        return super().decode(ids, skip_special_tokens=skip_special_tokens)
+
+
 def fake_prompt_builder(tokenizer, context, question, device=None):
     del device
     return [[900, *tokenizer.encode(context), 901,
@@ -239,9 +253,33 @@ def test_context_window_retains_every_overflow_chunk_in_order():
         overflow_chunk_tokens=3,
     )
     assert plan.context == "fghij"
-    assert plan.overflow_chunks == ("abc", "de")
-    assert plan.overflow_chunk_tokens == (3, 2)
+    assert [chunk.text for chunk in plan.overflow_chunks] == ["abc", "de"]
+    assert [chunk.token_count for chunk in plan.overflow_chunks] == [3, 2]
     assert plan.left_truncated_tokens == 5
+
+
+def test_context_window_preserves_legacy_decode_when_retention_is_off():
+    legacy = CleanupTrackingTokenizer()
+    plan_context_window(
+        legacy,
+        context="abcdefghij",
+        questions=["wxyz"],
+        prompt_builder=fake_prompt_builder,
+        max_prompt_tokens=12,
+    )
+    assert legacy.cleanup_values == [None]
+
+    retained = CleanupTrackingTokenizer()
+    plan_context_window(
+        retained,
+        context="abcdefghij",
+        questions=["wxyz"],
+        prompt_builder=fake_prompt_builder,
+        max_prompt_tokens=12,
+        overflow_chunk_tokens=3,
+    )
+    assert retained.cleanup_values
+    assert all(value is False for value in retained.cleanup_values)
 
 
 def test_parquet_discovery_rejects_multiple_cached_revisions():
@@ -363,7 +401,7 @@ def test_layered_overflow_memory_is_captured_once_and_reused_for_questions():
         max_prompt_tokens=12,
     )
 
-    assert window.overflow_chunks == ("abc", "de")
+    assert [chunk.text for chunk in window.overflow_chunks] == ["abc", "de"]
     assert runner.layered_rollout.capture_calls == ["abc", "de"]
     first, second = runner.layered_rollout.rollout_overflow
     assert first is second
@@ -584,6 +622,7 @@ def main():
     test_source_prompt_budget_reserves_official_buffer_and_generation()
     test_context_window_uses_longest_query_for_every_question()
     test_context_window_retains_every_overflow_chunk_in_order()
+    test_context_window_preserves_legacy_decode_when_retention_is_off()
     test_parquet_discovery_rejects_multiple_cached_revisions()
     test_explicit_data_dir_rejects_duplicate_parquet_shards()
     test_common_prefix_is_exact_and_empty_safe()
