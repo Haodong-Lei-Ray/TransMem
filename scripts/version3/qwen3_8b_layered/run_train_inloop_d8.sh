@@ -26,7 +26,7 @@ ENDPOINT=http://d-ceph-ssd-inside.pjlab.org.cn
 cd "$PROJ"
 mkdir -p "$PROJ/logs/qwen3_8b_layered"
 
-D=8
+D=${D:-8}
 GPUS=${GPUS:-8}
 POLICY=tf
 EPOCHS=${EPOCHS:-3}
@@ -41,7 +41,7 @@ TRAIN_DIR=${TRAIN_DIR:-}
 VAL_DIR=${VAL_DIR:-}
 DATA_PATH=${DATA_PATH:-$BENCH/hotpotqa_train_32k.parquet}
 VAL_DATA_PATH=${VAL_DATA_PATH:-$BENCH/hotpotqa_dev.parquet}
-OUTPUT_DIR=${OUTPUT_DIR:-$PROJ/checkpoints/v3_2_qwen3_8b_inloop_tf_d8_n4}
+OUTPUT_DIR=${OUTPUT_DIR:-$PROJ/checkpoints/v3_2_qwen3_8b_inloop_tf_d${D}_n4}
 SAVE_NVME_S3=${SAVE_NVME_S3:-1}
 S3_CKPT=${S3_CKPT:-s3://datafrontier/leihaodong/Project4/checkpoints/$(basename "$OUTPUT_DIR")}
 

@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -177,9 +179,11 @@ def test_4_trainer_tf():
         import transmem.train_inloop as ti
         orig = ti.InLoopDataset
         ti.InLoopDataset = (lambda data_dir, data_path, data_format, policy="tf",
-                            max_samples=None, records=None, records_=records:
+                            max_samples=None, records=None, fraction=1.0,
+                            sample_seed=42, records_=records:
                             orig(data_dir, data_path, data_format, policy=policy,
-                                 max_samples=max_samples, records=records_))
+                                 max_samples=max_samples, records=records_,
+                                 fraction=fraction, sample_seed=sample_seed))
         try:
             tr.args.val_data_dir = args.data_dir   # val 同集 (过拟合检查)
             tr.args.val_data_path = ""
@@ -254,9 +258,11 @@ def test_6_resume():
         import transmem.train_inloop as ti
         orig = ti.InLoopDataset
         ti.InLoopDataset = (lambda data_dir, data_path, data_format, policy="tf",
-                            max_samples=None, records=None, records_=records:
+                            max_samples=None, records=None, fraction=1.0,
+                            sample_seed=42, records_=records:
                             orig(data_dir, data_path, data_format, policy=policy,
-                                 max_samples=max_samples, records=records_))
+                                 max_samples=max_samples, records=records_,
+                                 fraction=fraction, sample_seed=sample_seed))
         try:
             tr = InLoopTrainer(args, model=tiny_llm(seed=7), tokenizer=_FakeTok())
             tr.run()
@@ -270,6 +276,45 @@ def test_6_resume():
         print(f"[6] PASS resume (latest.pt step={step_a} 恢复)")
 
 
+def test_7_oom_is_fail_fast():
+    """A single OOM must abort without skipping data or advancing global_step."""
+    from transmem.train_inloop import InLoopTrainer
+    import transmem.train_inloop as ti
+
+    with tempfile.TemporaryDirectory() as td:
+        records = _fake_data(Path(td) / "feat", n=2)
+        _write_cfg(td)
+        args = _trainer_args(td, policy="tf", epochs=1)
+        args.val_data_dir = None
+        tr = InLoopTrainer(args, model=tiny_llm(seed=7), tokenizer=_FakeTok())
+        orig = ti.InLoopDataset
+        ti.InLoopDataset = (lambda data_dir, data_path, data_format, policy="tf",
+                            max_samples=None, records=None, fraction=1.0,
+                            sample_seed=42, records_=records:
+                            orig(data_dir, data_path, data_format, policy=policy,
+                                 max_samples=max_samples, records=records_,
+                                 fraction=fraction, sample_seed=sample_seed))
+
+        def synthetic_oom(_item, policy):
+            raise torch.OutOfMemoryError("synthetic OOM")
+
+        tr.micro_loss = synthetic_oom
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                tr.run()
+        except torch.OutOfMemoryError:
+            pass
+        else:
+            raise AssertionError("OOM was swallowed instead of terminating training")
+        finally:
+            ti.InLoopDataset = orig
+        message = stderr.getvalue()
+        assert "FATAL CUDA OOM" in message and "sample_idx=" in message, message
+        assert tr.global_step == 0, "OOM must not advance global_step"
+        print("[7] PASS OOM fail-fast (diagnostic emitted, global_step unchanged)")
+
+
 if __name__ == "__main__":
     test_1_identity()
     test_2_train_infer_equiv()
@@ -278,4 +323,5 @@ if __name__ == "__main__":
     test_5_onpolicy_smoke()
     test_5b_pool_stage0_teacher_only()
     test_6_resume()
+    test_7_oom_is_fail_fast()
     print("\n✅ test_inloop 全部通过")

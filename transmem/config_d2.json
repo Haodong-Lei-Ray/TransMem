@@ -1,0 +1,26 @@
+{
+  "_comment": "TransMem v3 计划 2/3/5: depth=2 (抗死记消融), 其余与 config.json 完全一致.",
+
+  "dim": 2560,
+  "depth": 2,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 9728,
+  "rms_norm_eps": 1e-6,
+  "rope_theta": 5000000.0,
+  "max_position_embeddings": 262144,
+  "initializer_range": 0.02,
+  "attn_impl": "sdpa",
+
+  "causal": true,
+  "pos_mode": "rope",
+  "n_mem": 4,
+  "max_queries": 256,
+  "final_norm": true,
+  "zero_init_out": true,
+
+  "a_init": 1.0,
+  "learnable_a": false,
+  "warm_start": false
+}

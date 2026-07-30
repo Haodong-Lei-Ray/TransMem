@@ -22,6 +22,8 @@ PY="$UV run --python $VENV/bin/python python"
 cd "$PROJ"
 
 CKPT=${CKPT:-$PROJ/checkpoints/offpolicy_v3_p1_lmehqa_d4e60_forward_kl/best.pt}
+MODE=${MODE:-paired}
+ModelName=${ModelName:-Qwen/Qwen3-4B-Instruct-2507}
 OUT_ROOT=${OUT_ROOT:-$PROJ/eval_outputs/memory_agent_bench_v3_p1_main13}
 MAB_ROOT=${MAB_ROOT:-/mnt/petrelfs/leihaodong/Project1/MemoryAgentBenchProject/MemoryAgentBench}
 MAXQ=${MAXQ:-}
@@ -52,18 +54,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MODEL_PATH=${MODEL_PATH:-$MOUNT_POINT/leihaodong/Qwen/Qwen3-4B-Instruct-2507}
+MODEL_PATH=${MODEL_PATH:-$MOUNT_POINT/leihaodong/${ModelName}}
 test -f "$MODEL_PATH/config.json"
-test -f "$CKPT"
+if [[ "$MODE" == paired ]]; then test -f "$CKPT"; fi
 test -d "$MAB_ROOT"
 
 ARGS=(
   --model_path "$MODEL_PATH"
-  --ckpt "$CKPT"
+  --mode "$MODE"
   --mab_root "$MAB_ROOT"
   --output_dir "$OUT_ROOT"
   --attn_impl "$ATTN"
 )
+if [[ "$MODE" == paired ]]; then ARGS+=(--ckpt "$CKPT"); fi
 if [[ -n "$MAXQ" ]]; then ARGS+=(--max_questions_per_source "$MAXQ"); fi
 if [[ "$NO_PREFIX_CACHE" == 1 ]]; then ARGS+=(--no_prefix_cache); fi
 if [[ "$FORCE" == 1 ]]; then ARGS+=(--force); fi

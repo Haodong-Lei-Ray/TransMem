@@ -78,4 +78,17 @@ echo "Model=$MODEL_PATH S=$S D=$D layers=$((S-D))..$((S-1)) N=4 POLICY=$POLICY"
   --log_interval 25 --val_interval "${VAL_INTERVAL:-250}" --save_interval 500 \
   ${EXTRA:-}
 
+# ── 归档 + 腾空间 (成功训练后才走到这; 配额纪律, 对齐 run_inloop.sh) ────
+S3_CKPT=s3://datafrontier/leihaodong/Project4/checkpoints/$(basename "$OUTPUT_DIR")
+for f in best.pt result.json; do
+  [ -f "$OUTPUT_DIR/$f" ] && aws s3 cp "$OUTPUT_DIR/$f" "$S3_CKPT/$f" --endpoint-url "$ENDPOINT" --only-show-errors
+done
+LOCAL_SZ=$(stat -c %s "$OUTPUT_DIR/best.pt" 2>/dev/null || echo 0)
+S3_SZ=$( (aws s3 ls "$S3_CKPT/best.pt" --endpoint-url "$ENDPOINT" 2>/dev/null || true) | awk '{print $3}' | head -1)
+if [ -n "$S3_SZ" ] && [ "$S3_SZ" = "$LOCAL_SZ" ]; then
+  rm -f "$OUTPUT_DIR"/latest.pt "$OUTPUT_DIR"/step_*.pt
+  echo "已归档 $S3_CKPT (best.pt $S3_SZ B), 本地删 latest/step_*"
+else
+  echo "⚠️ S3 校验不一致 (local=$LOCAL_SZ s3=$S3_SZ), 保留本地全部 ckpt"
+fi
 echo "Qwen3-4B dynamic-layer 训练完成: S=$S D=$D"

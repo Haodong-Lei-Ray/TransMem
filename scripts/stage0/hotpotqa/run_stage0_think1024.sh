@@ -29,6 +29,8 @@ ATTN=${ATTN:-sdpa}          # flash_attention_2 在本 venv import 失败, 默�
 MAXN=${MAXN:-}              # 可选: 只抽前 MAXN 条 (先小跑); 空=全量
 THINKING=${THINKING:-true}  # true=开启 thinking 系统提示 (build_chat_prompt_ids thinking=True)
 ModelName=${ModelName:-Qwen/Qwen3-4B-Instruct-2507}  # S3 上 leihaodong/ 下的模型相对路径
+WORKERS=${WORKERS:-}        # 并发 worker 数 (每个一份模型副本); 空=作业内可见 GPU 数.
+                            # 例: WORKERS=8 sbatch --gres=gpu:8 run_stage0_think1024.sh
 
 # ── s3mount: 挂载模型 (权重是 S3 存储对象, 本地无) ──────────────────────────
 mkdir -p /mnt/petrelfs/leihaodong/s3mount_logs
@@ -63,27 +65,42 @@ echo "Model (s3mount): ${MODEL_PATH}"
 
 cd $PROJ
 
+# 并发数: 未指定则用作业内可见 GPU 数 (gpu:1 时即 1, 行为同顺序版)
+if [ -z "$WORKERS" ]; then WORKERS=$(nvidia-smi -L 2>/dev/null | wc -l); fi
+[ "$WORKERS" -ge 1 ] 2>/dev/null || WORKERS=1
+echo "WORKERS=$WORKERS"
+
 # 输出根目录: 与 run_offpolicy.sh 的 DATA_ROOT 约定对齐 (按模型名分目录);
 # 下游用 DATA_ROOT=$PROJ/data/hotpotqa_data/<模型名> 接入.
 OUT_ROOT=${OUT_ROOT:-$PROJ/data/hotpotqa_data/$(basename "$ModelName")}
 mkdir -p "$OUT_ROOT"
+
+# extract 失败 (watchdog 检测坏卡/CUDA 挂死后 fail-fast) → requeue 换节点断点续抽,
+# 最多重排 4 次. 需 sbatch --requeue 提交.
+requeue_or_die() {
+  if [ -n "$SLURM_JOB_ID" ] && [ "${SLURM_RESTART_COUNT:-0}" -lt 4 ]; then
+    echo "⚠️ extract 失败 (restart_count=${SLURM_RESTART_COUNT:-0}), scontrol requeue 续抽"
+    scontrol requeue "$SLURM_JOB_ID" && sleep 120
+  fi
+  exit 1
+}
 
 # 训练集 (32768 QA)
 $PY -m transmem.extract_features \
   --data_path $DATA/hotpotqa_train_32k.parquet --data_format hotpotqa-agentmem \
   --model_path $MODEL_PATH \
   --output_dir $OUT_ROOT/stage0_train_think1024 \
-  --N $N --max_answer_tokens $MAX_ANS \
+  --N $N --max_answer_tokens $MAX_ANS --num_workers $WORKERS \
   --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
-  $([ "$THINKING" = "true" ] && echo --thinking)
+  $([ "$THINKING" = "true" ] && echo --thinking) || requeue_or_die
 
 # 验证集 (128 QA)
 $PY -m transmem.extract_features \
   --data_path $DATA/hotpotqa_dev.parquet --data_format hotpotqa-agentmem \
   --model_path $MODEL_PATH \
   --output_dir $OUT_ROOT/stage0_dev_think1024 \
-  --N $N --max_answer_tokens $MAX_ANS \
+  --N $N --max_answer_tokens $MAX_ANS --num_workers $WORKERS \
   --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
-  $([ "$THINKING" = "true" ] && echo --thinking)
+  $([ "$THINKING" = "true" ] && echo --thinking) || requeue_or_die
 
 echo "✅ Stage 0 完成: $OUT_ROOT/stage0_train_think1024 , stage0_dev_think1024"

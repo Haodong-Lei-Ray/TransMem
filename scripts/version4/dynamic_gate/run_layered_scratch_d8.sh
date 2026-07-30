@@ -13,5 +13,5 @@ set -euo pipefail
 export INIT_SCHEME=scratch_joint
 export S=36
 export D=8
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-exec "$SCRIPT_DIR/run_layered_inloop.sh"
+# sbatch 把脚本拷到 /var/spool/slurmd 执行, BASH_SOURCE 定位会失效 — 用绝对路径
+exec /mnt/petrelfs/leihaodong/Project4/scripts/version4/dynamic_gate/run_layered_inloop.sh

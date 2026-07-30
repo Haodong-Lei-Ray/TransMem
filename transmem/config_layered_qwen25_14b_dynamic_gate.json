@@ -1,0 +1,34 @@
+{
+  "_comment": "Qwen2.5-14B-Instruct layered/in-loop TransMem + token-scalar dynamic gate. Structural fields mirror Qwen/Qwen2.5-14B-Instruct/config.json (48 layers, dim 5120, head_dim 5120/40=128, intermediate 13824, max_position 32768); gate fields match config_layered_8b_dynamic_gate.json. inject_layers is informational: runner passes --D 4 -> final layers [44,45,46,47]. TransMem 内部块是本项目自己的 Qwen 块实现, 与 backbone 是否为 qwen2 架构无关, 只需 dim 对齐.",
+
+  "dim": 5120,
+  "block_depth": 1,
+  "num_heads": 40,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 13824,
+  "rms_norm_eps": 1e-6,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 32768,
+  "initializer_range": 0.02,
+  "attn_impl": "sdpa",
+
+  "causal": true,
+  "pos_mode": "rope",
+  "n_mem": 4,
+  "hm_mode": "floor",
+  "max_queries": 256,
+  "final_norm": true,
+  "zero_init_out": true,
+
+  "a_init": 1.0,
+  "learnable_a": false,
+
+  "gate_mode": "centered_sigmoid",
+  "gate_granularity": "token_scalar",
+  "gate_max": 2.0,
+  "gate_temperature": 1.0,
+  "gate_init": 1.0,
+
+  "inject_layers": [44, 45, 46, 47]
+}

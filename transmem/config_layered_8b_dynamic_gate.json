@@ -1,0 +1,34 @@
+{
+  "_comment": "Qwen3-8B layered/in-loop TransMem with an independent token-scalar gate per injected layer. Structural fields match config_layered_8b.json (Qwen/Qwen3-8B/config.json); gate fields match config_layered_dynamic_gate.json (4B gate experiments).",
+
+  "dim": 4096,
+  "block_depth": 1,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 12288,
+  "rms_norm_eps": 1e-6,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 40960,
+  "initializer_range": 0.02,
+  "attn_impl": "sdpa",
+
+  "causal": true,
+  "pos_mode": "rope",
+  "n_mem": 4,
+  "hm_mode": "floor",
+  "max_queries": 256,
+  "final_norm": true,
+  "zero_init_out": true,
+
+  "a_init": 1.0,
+  "learnable_a": false,
+
+  "gate_mode": "centered_sigmoid",
+  "gate_granularity": "token_scalar",
+  "gate_max": 2.0,
+  "gate_temperature": 1.0,
+  "gate_init": 1.0,
+
+  "inject_layers": [28, 29, 30, 31, 32, 33, 34, 35]
+}

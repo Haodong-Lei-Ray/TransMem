@@ -1,0 +1,26 @@
+{
+  "_comment": "实验E1: 富记忆池. 与 config.json 唯一区别是 n_mem 4->256 (HM 从 4 个定位固定向量变成 256 个均匀采样上下文向量, 让 TransMem 因果自注意力从中选相关记忆). 需配 stage0 --N 256 的特征.",
+
+  "dim": 2560,
+  "depth": 4,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 9728,
+  "rms_norm_eps": 1e-6,
+  "rope_theta": 5000000.0,
+  "max_position_embeddings": 262144,
+  "initializer_range": 0.02,
+  "attn_impl": "sdpa",
+
+  "causal": true,
+  "pos_mode": "rope",
+  "n_mem": 256,
+  "max_queries": 256,
+  "final_norm": true,
+  "zero_init_out": true,
+
+  "a_init": 1.0,
+  "learnable_a": false,
+  "warm_start": false
+}

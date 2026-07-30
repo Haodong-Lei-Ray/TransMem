@@ -36,6 +36,8 @@ TRAIN_DIR=${TRAIN_DIR:-$FEAT/stage0_train_short200}
 VAL_DIR=${VAL_DIR:-$FEAT/stage0_dev_short200}
 DATA_PATH=${DATA_PATH:-$BENCH/hotpotqa_train_32k.parquet}
 VAL_DATA_PATH=${VAL_DATA_PATH:-$BENCH/hotpotqa_dev.parquet}
+DATA_FORMAT=${DATA_FORMAT:-hotpotqa-agentmem}
+VAL_DATA_FORMAT=${VAL_DATA_FORMAT:-$DATA_FORMAT}
 
 INIT_ARGS=()
 case "$INIT_SCHEME" in
@@ -97,11 +99,12 @@ echo "dynamic gate layered: init=$INIT_SCHEME S=$S D=$D seed=$SEED"
 echo "calibration=$CALIBRATION_STEPS joint=$JOINT_STEPS prior=$PRIOR_WEIGHT/$PRIOR_STEPS"
 "$UV" run --python "$VENV/bin/python" python -m torch.distributed.run \
   --standalone --nproc_per_node="$GPUS" -m transmem.train_inloop \
-  --data_dir "$TRAIN_DIR" --data_path "$DATA_PATH" --data_format hotpotqa-agentmem \
-  --val_data_dir "$VAL_DIR" --val_data_path "$VAL_DATA_PATH" --val_max 128 \
+  --data_dir "$TRAIN_DIR" --data_path "$DATA_PATH" --data_format "$DATA_FORMAT" \
+  --val_data_dir "$VAL_DIR" --val_data_path "$VAL_DATA_PATH" \
+  --val_data_format "$VAL_DATA_FORMAT" --val_max "${VAL_MAX:-128}" \
   --model_path "$MODEL_PATH" --config "$CONFIG" --D "$D" --S "$S" \
   --policy tf --divergence forward_kl \
-  --init_scheme "$INIT_SCHEME" "${INIT_ARGS[@]}" \
+  --init_scheme "$INIT_SCHEME" ${INIT_ARGS[@]+"${INIT_ARGS[@]}"} \
   --gate_calibration_steps "$CALIBRATION_STEPS" \
   --joint_finetune_steps "$JOINT_STEPS" --max_steps "$TOTAL_STEPS" \
   --gate_prior_weight "$PRIOR_WEIGHT" --gate_prior_anneal_steps "$PRIOR_STEPS" \
@@ -110,6 +113,7 @@ echo "calibration=$CALIBRATION_STEPS joint=$JOINT_STEPS prior=$PRIOR_WEIGHT/$PRI
   --lr "$BASE_LR" --gate_lr "$GATE_LR" --weight_decay 0.0 \
   --warmup_steps 100 --grad_clip 1.0 --num_workers 2 \
   --log_interval 25 --val_interval 250 --save_interval 500 \
-  "${RESUME_ARGS[@]}"
+  ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"} \
+  ${EXTRA:-}
 
 echo "dynamic gate layered 完成: $OUTPUT_DIR"

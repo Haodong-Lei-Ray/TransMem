@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J transmem_locomo
+#SBATCH -J e09_locomo
 #SBATCH -p DataFrontier_Explore
 #SBATCH -N 1
 #SBATCH --gres=gpu:1
@@ -24,7 +24,8 @@ export NLTK_DATA=/mnt/petrelfs/leihaodong/nltk_data   # F1 评分要 Porter stem
 cd $PROJ
 
 DATA_FILE=${DATA_FILE:-/mnt/petrelfs/leihaodong/Project1/data/locomo10.json}
-CKPT=${CKPT:-$PROJ/checkpoints/offpolicy_short128_forward_kl/latest.pt}
+# v2 = 序列级 TransMem (rollout 带 KV cache, token-by-token); 旧 ckpt 在 offpolicy_short128_forward_kl
+CKPT=${CKPT:-$PROJ/checkpoints/offpolicy_v2_short128_forward_kl/latest.pt}
 MODES=${MODES:-"teacher student transmem"}
 N=${N:-4}
 MAX_ANS=${MAX_ANS:-50}        # LoCoMo 官方 50 new tokens
@@ -56,7 +57,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MODEL_PATH=${MODEL_PATH:-${MOUNT_POINT}/leihaodong/Qwen/Qwen3-4B-Instruct-2507}
+ModelName=${ModelName:-Qwen/Qwen3-4B-Instruct-2507}   # 8B 评测: ModelName=Qwen/Qwen3-8B
+MODEL_PATH=${MODEL_PATH:-${MOUNT_POINT}/leihaodong/${ModelName}}
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "FATAL: 模型不可见 ${MODEL_PATH} (s3mount 失败?)" >&2
   ls -la "${MOUNT_POINT}/leihaodong/Qwen/" >&2 || true

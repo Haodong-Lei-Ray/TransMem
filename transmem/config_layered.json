@@ -23,6 +23,7 @@
 
   "a_init": 1.0,
   "learnable_a": false,
+  "gate_mode": "constant",
 
   "inject_layers": [35]
 }

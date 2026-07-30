@@ -96,25 +96,23 @@ fi
 EVAL_CKPT=$LOCAL_CKPT_DIR/$(basename "$SOURCE_CKPT")
 cp "$SOURCE_CKPT" "$EVAL_CKPT"
 
-thinking_args=()
-[[ "${THINKING:-0}" == "1" ]] && thinking_args=(--thinking)
-prompt_budget_args=()
-[[ -n "$MAX_PROMPT_TOKENS" ]] && prompt_budget_args=(--max_prompt_tokens "$MAX_PROMPT_TOKENS")
-
 echo "LongMemEval parallel eval: model=$MODEL_NAME checkpoint=$S3_CKPT_REL gpus=$GPU_COUNT workers=$WORKERS data=$DATA_FILE output=$OUT_ROOT thinking=${THINKING:-0} max_prompt_tokens=${MAX_PROMPT_TOKENS:-none}"
 pids=()
 for ((worker=0; worker<WORKERS; worker++)); do
   device=$((worker % GPU_COUNT))
   echo "worker=$worker shard=$worker/$WORKERS device=cuda:$device"
-  "${PY[@]}" scripts/eval/eval_longmemeval.py \
+  worker_cmd=("${PY[@]}" scripts/eval/eval_longmemeval.py \
     --data_file "$DATA_FILE" --model_path "$MODEL_PATH" \
     --mode "$MODE" --ckpt "$EVAL_CKPT" --N 4 \
-    --max_answer_tokens "$MAX_ANS" --max_samples "$MAXQ" \
-    "${thinking_args[@]}" "${prompt_budget_args[@]}" \
+    --max_answer_tokens "$MAX_ANS" --max_samples "$MAXQ")
+  [[ "${THINKING:-0}" == "1" ]] && worker_cmd+=(--thinking)
+  [[ -n "$MAX_PROMPT_TOKENS" ]] && worker_cmd+=(--max_prompt_tokens "$MAX_PROMPT_TOKENS")
+  worker_cmd+=( \
     --attn_impl sdpa --device "cuda:$device" \
     --num_shards "$WORKERS" --shard_index "$worker" \
     --output_jsonl "$OUT_ROOT/shard_${worker}.jsonl" \
-    --summary_json "$OUT_ROOT/shard_${worker}.summary.json" \
+    --summary_json "$OUT_ROOT/shard_${worker}.summary.json")
+  "${worker_cmd[@]}" \
     >"$OUT_ROOT/shard_${worker}.log" 2>&1 &
   pids+=("$!")
 done
@@ -139,15 +137,18 @@ done
   "${shards[@]}"
 
 if [[ "$RUN_OFFICIAL_JUDGE" == "1" ]]; then
-  export http_proxy="$SAVED_http_proxy" https_proxy="$SAVED_https_proxy"
-  export HTTP_PROXY="$SAVED_HTTP_PROXY" HTTPS_PROXY="$SAVED_HTTPS_PROXY"
-  export all_proxy="$SAVED_all_proxy" ALL_PROXY="$SAVED_ALL_PROXY"
+  if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
+    # The lab gateway is directly reachable; inherited public-network proxies
+    # can make requests to its IP hang indefinitely.
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+    export all_proxy= ALL_PROXY=
+  else
+    export http_proxy="$SAVED_http_proxy" https_proxy="$SAVED_https_proxy"
+    export HTTP_PROXY="$SAVED_HTTP_PROXY" HTTPS_PROXY="$SAVED_HTTPS_PROXY"
+    export all_proxy="$SAVED_all_proxy" ALL_PROXY="$SAVED_ALL_PROXY"
+  fi
   echo "Running official LongMemEval judge: $JUDGE_MODEL"
-  "${PY[@]}" data/longmemeval/src/evaluation/evaluate_qa.py \
-    "$JUDGE_MODEL" "$OUT_ROOT/hypotheses.jsonl" "$DATA_FILE" \
-    | tee "$OUT_ROOT/official_judge.log"
-  "${PY[@]}" data/longmemeval/src/evaluation/print_qa_metrics.py \
-    "$OUT_ROOT/hypotheses.jsonl.eval-results-$JUDGE_MODEL" "$DATA_FILE" \
-    | tee "$OUT_ROOT/official_metrics.txt"
+  export OUT_ROOT DATA_FILE JUDGE_MODEL
+  bash scripts/eval/run_longmemeval_official_judge.sh
 fi
 echo "LongMemEval parallel evaluation complete: $OUT_ROOT"

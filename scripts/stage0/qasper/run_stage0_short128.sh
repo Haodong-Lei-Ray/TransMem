@@ -22,10 +22,14 @@ PY="$UV run --python $VENV/bin/python python"
 DATA=/mnt/petrelfs/leihaodong/Project4/data/qasper
 
 N=${N:-4}
+TAG=${TAG:-short128}       # 输出子目录 stage0_{train,dev}_${TAG}; 改 N 时换 TAG 避免覆盖基线
+WORKERS=${WORKERS:-1}      # 多进程数据并行 (每 worker 一份模型, 轮转绑 GPU); 整机 8 卡设 8
 MAX_ANS=${MAX_ANS:-128}
+TRAJ=${TRAJ:-teacher}     # teacher=C_S rollout 当软目标(KD,默认); golden=teacher-force 数据集 golden 答案(SFT)
 ATTN=${ATTN:-sdpa}          # flash_attention_2 在本 venv import 失败, 默认 sdpa
 MAXN=${MAXN:-}              # 可选: 只抽前 MAXN 条 (先小跑); 空=全量
 THINKING=${THINKING:-false} # true=开启 thinking 系统提示 (build_chat_prompt_ids thinking=True)
+ModelName=${ModelName:-Qwen/Qwen3-4B-Instruct-2507}  # S3 leihaodong/ 下相对路径; 8B 用 Qwen/Qwen3-8B
 
 # ── s3mount: 挂载 Qwen3-4B 模型 (权重是 S3 存储对象, 本地无) ──────────────
 mkdir -p /mnt/petrelfs/leihaodong/s3mount_logs
@@ -50,7 +54,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MODEL_PATH=${MODEL_PATH:-${MOUNT_POINT}/leihaodong/Qwen/Qwen3-4B-Instruct-2507}
+MODEL_PATH=${MODEL_PATH:-${MOUNT_POINT}/leihaodong/${ModelName}}
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "FATAL: 模型不可见 ${MODEL_PATH} (s3mount 失败?)" >&2
   ls -la "${MOUNT_POINT}/leihaodong/Qwen/" >&2 || true
@@ -61,25 +65,25 @@ echo "Model (s3mount): ${MODEL_PATH}"
 cd $PROJ
 
 # 输出根目录: 与 run_offpolicy.sh 的 DATA_ROOT 默认值对齐 (按模型名分目录)
-OUT_ROOT=${OUT_ROOT:-$PROJ/data/qasper_data/Qwen3-4B-Instruct-2507}
+OUT_ROOT=${OUT_ROOT:-$PROJ/data/qasper_data/$(basename "$ModelName")}
 mkdir -p "$OUT_ROOT"
 
 # 训练集 (2240 QA)
 $PY -m transmem.extract_features \
   --data_path $DATA/qasper_train.json --data_format qasper \
   --model_path $MODEL_PATH \
-  --output_dir $OUT_ROOT/stage0_train_short128 \
-  --N $N --max_answer_tokens $MAX_ANS \
-  --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
+  --output_dir $OUT_ROOT/stage0_train_${TAG} \
+  --N $N --max_answer_tokens $MAX_ANS --trajectory $TRAJ \
+  --attn_impl $ATTN --save_dtype bfloat16 --num_workers $WORKERS ${MAXN:+--max_samples $MAXN} \
   $([ "$THINKING" = "true" ] && echo --thinking)
 
 # 验证集 (927 QA)
 $PY -m transmem.extract_features \
   --data_path $DATA/qasper_dev.json --data_format qasper \
   --model_path $MODEL_PATH \
-  --output_dir $OUT_ROOT/stage0_dev_short128 \
-  --N $N --max_answer_tokens $MAX_ANS \
-  --attn_impl $ATTN --save_dtype bfloat16 ${MAXN:+--max_samples $MAXN} \
+  --output_dir $OUT_ROOT/stage0_dev_${TAG} \
+  --N $N --max_answer_tokens $MAX_ANS --trajectory $TRAJ \
+  --attn_impl $ATTN --save_dtype bfloat16 --num_workers $WORKERS ${MAXN:+--max_samples $MAXN} \
   $([ "$THINKING" = "true" ] && echo --thinking)
 
-echo "✅ Stage 0 完成: $OUT_ROOT/stage0_train_short128 , stage0_dev_short128"
+echo "✅ Stage 0 完成: $OUT_ROOT/stage0_train_${TAG} , stage0_dev_${TAG}"

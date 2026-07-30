@@ -1,0 +1,36 @@
+{
+  "_comment": "TransMem 配置 for Qwen3-8B backbone (dim 4096). 用户额外提议: 4B->8B 是否更好. 需配 Qwen3-8B 抽的 stage0 特征 (dim=4096). block 仍 Qwen3 同款, 仅尺寸随 8B config 变.",
+
+  "dim": 4096,
+  "depth": 4,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 12288,
+  "rms_norm_eps": 1e-6,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 40960,
+  "initializer_range": 0.02,
+  "attn_impl": "sdpa",
+
+  "causal": true,
+  "pos_mode": "rope",
+  "n_mem": 4,
+  "max_queries": 256,
+  "final_norm": true,
+  "zero_init_out": true,
+
+  "a_init": 1.0,
+  "learnable_a": false,
+  "warm_start": false,
+
+  "_notes": {
+    "dim": "Qwen3-8B hidden_size=4096 (4B 是 2560)",
+    "intermediate_size": "Qwen3-8B=12288 (4B 9728)",
+    "rope_theta": "Qwen3-8B=1e6 (4B 实测 5e6, 不同!)",
+    "max_position_embeddings": "Qwen3-8B=40960 (4B 262144)",
+    "num_hidden_layers": "8B backbone 36 层 (与 4B 同); TransMem 仍取 depth=4",
+    "model_kind": "S3 上是 Qwen3-8B (非 -Instruct-2507), 是 hybrid-thinking 模型; 抽特征/评测需确认关 thinking (build_chat_prompt_ids thinking=False) 且 chat template 兼容",
+    "ckpt_size": "TransMem @ dim4096 ~1.05B 参数 (4B 版 410M), ckpt ~12G/个 -> 注意配额"
+  }
+}
