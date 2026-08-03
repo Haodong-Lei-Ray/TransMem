@@ -325,3 +325,15 @@ for the current layered dynamic-gate recipe.
 
 If you use TransMem, please cite the accompanying paper. Citation metadata will
 be added here when the public version is available.
+
+```text
+@misc{lei2026transmemtransforminghiddenstates,
+      title={TransMem: Transforming Hidden States into Memory for Large Language Models}, 
+      author={Haodong Lei and Junming Liu and Yirong Chen and Pinlong Cai and Botian Shi and Ding Wang and Hongsong Wang},
+      year={2026},
+      eprint={2607.29032},
+      archivePrefix={arXiv},
+      primaryClass={cs.MA},
+      url={https://arxiv.org/abs/2607.29032}, 
+}
+```
