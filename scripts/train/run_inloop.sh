@@ -10,7 +10,7 @@
 #SBATCH -e /mnt/petrelfs/leihaodong/Project4/logs/run_inloop/%j.err
 
 # ── v3.2: TransMem-Layer 在环训练 (LLM 层进训练环). 必填 D.
-#   例: D=8 sbatch scripts/run_inloop.sh ;  POLICY=onpolicy D=8 sbatch ...
+#   例: D=8 sbatch scripts/train/run_inloop.sh ;  POLICY=onpolicy D=8 sbatch ...
 #   数据 = 本地 stage0 基础特征 (answer_ids+hq_tea) + 原始 parquet; 无需 layered8 特征.
 #   spot 抢占 → requeue → latest.pt 原子档自动断点续训.
 set -e

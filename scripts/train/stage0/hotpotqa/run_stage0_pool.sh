@@ -73,7 +73,7 @@ echo "WORKERS=$WORKERS  POOL_NS=$POOL_NS  OUT_SUFFIX=$OUT_SUFFIX"
 
 # 输出: 默认 S3 (经挂载点写); OUT_ROOT 可覆写到本地 petrelfs
 # (datafrontier 桶满时的降级路径, 2026-07-09: 网格剪到 {4..128} 后 16GB 本地放得下).
-# 训练侧 S3 部分用 aws s3 sync 拉到 /nvme, 见 scripts/run_offpolicy_pool.sh.
+# 训练侧 S3 部分用 aws s3 sync 拉到 /nvme, 见 scripts/train/run_offpolicy_pool.sh.
 OUT_ROOT=${OUT_ROOT:-${MOUNT_POINT}/leihaodong/Project4/data/hotpotqa_pool${OUT_SUFFIX}}
 mkdir -p "$OUT_ROOT"
 # manifest 留 petrelfs: 追加写 + 抢占 requeue 跨节点续抽

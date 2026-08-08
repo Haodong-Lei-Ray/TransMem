@@ -46,4 +46,4 @@ case "$EXP" in
     ;;
 esac
 
-exec bash "$PROJ/scripts/run_offpolicy.sh"
+exec bash "$PROJ/scripts/train/run_offpolicy.sh"

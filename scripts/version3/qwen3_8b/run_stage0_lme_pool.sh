@@ -17,4 +17,4 @@ export HM_MODE=frac
 export MAX_ANS=200
 export WORKERS=${WORKERS:-8}
 export OUT_ROOT=${OUT_ROOT:-$PROJ/data/longmemeval_data/Qwen3-8B-pool-n4-n8}
-exec bash "$PROJ/scripts/stage0/longmemeval/run_stage0.sh"
+exec bash "$PROJ/scripts/train/stage0/longmemeval/run_stage0.sh"

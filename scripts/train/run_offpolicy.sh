@@ -11,7 +11,7 @@
 # ── Stage 1 (off-policy): 训练 TransMem, 穿冻结 lm_head 逐位置蒸馏 ──
 # 只用 Stage0 特征 + lm_head, 不加载 LLM. 默认 torchrun 8 卡 DDP (整机独占,
 # 也避开单卡与他人进程共卡被挤 OOM 的问题, 见 10196150/10196617).
-# 单卡跑法: GPUS=1 sbatch --gres=gpu:1 scripts/run_offpolicy.sh
+# 单卡跑法: GPUS=1 sbatch --gres=gpu:1 scripts/train/run_offpolicy.sh
 set -e
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

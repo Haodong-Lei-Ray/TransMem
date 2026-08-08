@@ -22,4 +22,4 @@ export OUT_ROOT=$PROJ/data/locomo10_data/Qwen3-4B-Instruct-2507
 export OUTPUT_TAG=stage0_full_short50_n${N}
 export ModelName=Qwen/Qwen3-4B-Instruct-2507
 
-exec bash "$PROJ/scripts/stage0/locomo/run_stage0_qwen3_4b_d4.sh"
+exec bash "$PROJ/scripts/train/stage0/locomo/run_stage0_qwen3_4b_d4.sh"

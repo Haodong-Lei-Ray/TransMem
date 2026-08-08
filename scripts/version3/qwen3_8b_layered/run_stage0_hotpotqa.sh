@@ -25,4 +25,4 @@ export WORKERS=${WORKERS:-4}
 export OUT_SUFFIX=_qwen3_8b_n4_n8
 export OUT_ROOT=$PROJ/data/hotpotqa_data/Qwen3-8B-pool-n4-n8
 
-exec bash "$PROJ/scripts/stage0/hotpotqa/run_stage0_pool.sh"
+exec bash "$PROJ/scripts/train/stage0/hotpotqa/run_stage0_pool.sh"

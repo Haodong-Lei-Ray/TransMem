@@ -218,6 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 /Qwen3
+
+# macOS Finder metadata
+.DS_Store
 /data
 scripts/smoke
 /docs

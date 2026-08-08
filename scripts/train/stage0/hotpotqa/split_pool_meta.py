@@ -9,7 +9,7 @@ meta.json — 训练加载会找不到 S3 部分的文件. 本脚本:
   2) S3 部分的条目写 meta_s3pool_train.json (pool_ns=[4..384], 512 行超集),
      训练包装脚本 sync S3 -> /nvme 后把它拷成该目录的 meta.json.
 
-用法: python scripts/stage0/hotpotqa/split_pool_meta.py
+用法: python scripts/train/stage0/hotpotqa/split_pool_meta.py
 """
 import json
 from pathlib import Path

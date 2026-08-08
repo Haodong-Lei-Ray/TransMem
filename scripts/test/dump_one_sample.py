@@ -6,7 +6,7 @@
 学生 teacher-forcing HM/HQ_stu), 只额外写一份人读 json(每个 token、每个 hidden 的范数/前几维).
 
 用法 (GPU):
-  python scripts/dump_one_sample.py \
+  python scripts/test/dump_one_sample.py \
     --record data/qasper/sample_qa.json --data_format qasper \
     --model_path /mnt/petrelfs/leihaodong/models/Qwen3-4B-Instruct-2507 \
     --output_dir scripts/smoke --N 4 --max_answer_tokens 50

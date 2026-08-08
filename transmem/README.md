@@ -49,9 +49,9 @@ PY=/mnt/petrelfs/leihaodong/Project1/delta-Mem/.venv-eval/bin/python
 $PY -m transmem.test_shapes
 
 # 1) Stage 0 抽特征 (GPU)            —— 见 scripts/run_stage0.sh
-# 2a) off-policy 训练 (GPU, 轻)      —— 见 scripts/run_offpolicy.sh
-# 2b) on-policy/OPD 训练 (GPU)       —— 见 scripts/run_onpolicy.sh
-# 3) 评测 (GPU): 先 sanity check     —— 见 scripts/run_eval.sh
+# 2a) off-policy 训练 (GPU, 轻)      —— 见 scripts/train/run_offpolicy.sh
+# 2b) on-policy/OPD 训练 (GPU)       —— 见 scripts/train/run_onpolicy.sh
+# 3) 评测 (GPU): 先 sanity check     —— 见 scripts/eval/run_eval.sh
 $PY -m transmem.evaluate --eval_file <eval_50.json> --model_path <model> --mode teacher   # 上界
 $PY -m transmem.evaluate --eval_file <eval_50.json> --model_path <model> --mode student   # 基线
 ```

@@ -10,7 +10,7 @@
 #SBATCH -e /mnt/petrelfs/leihaodong/Project4/logs/run_layered/%j.err
 
 # ── v3 计划 6: TransMem-Layer 训练 (D 消融). 必填 D; 特征在 S3 时填 S3_FEAT 先 sync.
-#   例: D=4 TRAIN_DIR=... VAL_DIR=... OUTPUT_DIR=... sbatch scripts/run_layered.sh
+#   例: D=4 TRAIN_DIR=... VAL_DIR=... OUTPUT_DIR=... sbatch scripts/train/run_layered.sh
 #   结束后 best.pt+result.json 归档 S3, 删 latest/step_* (配额纪律).
 set -e
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY

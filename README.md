@@ -1,40 +1,29 @@
 # TransMem
 
+<p align="center">
+<a href="https://creativecommons.org/licenses/by/4.0/"><img alt="License: CC-BY-4.0" src="https://img.shields.io/badge/License-CC_BY_4.0-brightgreen.svg"></a>
+<a href="https://arxiv.org/abs/2607.29032"><img src="https://img.shields.io/badge/arXiv-Paper-B31B1B?style=flat-square&logo=arxiv&logoColor=white"></a>
+<a href="https://huggingface.co/collections/Rayleihaodong/transmem"><img alt="Huggingface" src="https://img.shields.io/badge/🤗_Huggingface-Model-ff9800.svg"></a>
+</p>
+
 TransMem is a plug-in memory module for frozen decoder-only language models. It
 compresses information from a long context into a small set of memory states and
 injects a learned residual into selected LLM layers while the answer is decoded.
 The backbone LLM remains frozen; only TransMem and, when enabled, its dynamic
 gates are trained.
 
+![TransMem overview](asset/main.png)
+
 This repository contains training code, checkpoints, and evaluation adapters for
 [LoCoMo](#locomo), [MemoryAgentBench](#memoryagentbench), and
 [HotpotQA](#hotpotqa).
-
-## How it works
-
-For a layered TransMem checkpoint, a one-layer memory block is attached to each
-of the last \(D\) backbone layers:
-
-```text
-long context ──► memory states HM
-                       │
-H^(l-1) ──► LLM layer l ──► H^l
-    └─────► TransMem l ────► ΔH^l
-                              │
-                    H^l + gate^l ⊙ ΔH^l
-```
-
-The current default configuration is `D=4`, `N=4` memory slots, and a
-token-scalar dynamic gate. A native `best.pt` stores the TransMem configuration
-and adapter weights, but not the frozen backbone. Evaluation must therefore use
-the same backbone family and hidden size as training.
 
 ## Repository layout
 
 ```text
 transmem/                  Core modules, training, rollout, and checkpoint code
 transmem/config*.json      Model- and ablation-specific configurations
-scripts/stage0/            Teacher/student feature extraction
+scripts/train/stage0/      Teacher/student feature extraction
 scripts/version*/          Training recipes and experiment entrypoints
 scripts/eval/              Benchmark adapters and shard mergers
 data/                      Prepared benchmark data and preprocessing tools

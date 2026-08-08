@@ -6,7 +6,7 @@ HM_stu/per_token), 但直接读已缓存的 shard .pt (hm_stu/hq_stu/hq_tea/answ
 不重跑模型 forward, 只用 tokenizer (CPU) 做 token 解码 + 长度统计, 跑得很快.
 
 用法:
-  python scripts/dump_wrong_samples.py \
+  python scripts/test/dump_wrong_samples.py \
     --stage0_dir data/qasper_data/stage0_train_short128 \
     --model_path /mnt/petrelfs/leihaodong/models/Qwen3-4B-Instruct-2507 \
     --output_dir scripts/smoke/wrong_train_short128

@@ -21,4 +21,4 @@ export MAX_ANS=200
 export WORKERS=4
 export OUT_SUFFIX=_qwen3_14b_n4_n8
 
-exec bash /mnt/petrelfs/leihaodong/Project4/scripts/stage0/hotpotqa/run_stage0_pool.sh
+exec bash /mnt/petrelfs/leihaodong/Project4/scripts/train/stage0/hotpotqa/run_stage0_pool.sh

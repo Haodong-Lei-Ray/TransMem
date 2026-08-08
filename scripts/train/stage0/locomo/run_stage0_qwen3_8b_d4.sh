@@ -17,4 +17,4 @@ set -euo pipefail
 export ModelName=Qwen/Qwen3-8B
 export OUT_ROOT=/mnt/petrelfs/leihaodong/Project4/data/locomo_data/Qwen3-8B
 
-exec bash /mnt/petrelfs/leihaodong/Project4/scripts/stage0/locomo/run_stage0_qwen3_4b_d4.sh
+exec bash /mnt/petrelfs/leihaodong/Project4/scripts/train/stage0/locomo/run_stage0_qwen3_4b_d4.sh

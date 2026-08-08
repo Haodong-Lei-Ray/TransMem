@@ -26,4 +26,4 @@ export VAL_DATA_PATH=$PROJ/data/hotpotqa-benchmark/hotpotqa-agentmem/hotpotqa_de
 export VAL_DATA_FORMAT=hotpotqa-agentmem,longmemeval
 export OUTPUT_DIR=$PROJ/checkpoints/v4_inloop_tf_mix_d4
 
-exec bash "$PROJ/scripts/run_inloop.sh"
+exec bash "$PROJ/scripts/train/run_inloop.sh"

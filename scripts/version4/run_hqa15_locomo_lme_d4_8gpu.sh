@@ -31,4 +31,4 @@ export VAL_DATA_FORMAT=hotpotqa-agentmem,longmemeval
 export OUTPUT_DIR=$PROJ/checkpoints/v4_inloop_tf_hqa15_locomo_lme_d4
 export EXTRA="--data_fractions 0.15,1,1 --data_sample_seed 42 --seed 42 --save_nvme_s3"
 
-exec bash "$PROJ/scripts/run_inloop.sh"
+exec bash "$PROJ/scripts/train/run_inloop.sh"

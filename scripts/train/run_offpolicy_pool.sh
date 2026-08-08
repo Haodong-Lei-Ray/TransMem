@@ -10,7 +10,7 @@
 #SBATCH -e /mnt/petrelfs/leihaodong/Project4/logs/run_offpolicy/%j.err
 
 # ── N 消融训练包装 (双源池): S3 部分 sync 到 /nvme + 本地 pool128 拼接 ──
-# 用法: NMEM=64 sbatch -J e09_pool_n64 scripts/run_offpolicy_pool.sh
+# 用法: NMEM=64 sbatch -J e09_pool_n64 scripts/train/run_offpolicy_pool.sh
 # 数据: 前 6,935 样本 = S3 512 行全网格池 (桶满前写入, 读不受影响);
 #       其余样本    = 本地 pool128 (128 行, {4..128} 网格).
 #       两目录都带各自 meta/hm_maps, OffPolicyDataset 按 config.n_mem 切片后拼接.
@@ -23,7 +23,7 @@ export AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED
 
 PROJ=/mnt/petrelfs/leihaodong/Project4
 EP="--endpoint-url http://d-ceph-ssd-inside.pjlab.org.cn"
-NMEM=${NMEM:?用法: NMEM=64 sbatch -J e09_pool_n64 scripts/run_offpolicy_pool.sh}
+NMEM=${NMEM:?用法: NMEM=64 sbatch -J e09_pool_n64 scripts/train/run_offpolicy_pool.sh}
 
 S3TRAIN=s3://datafrontier/leihaodong/Project4/data/hotpotqa_pool/stage0_train_short200_pool
 NVME_A=/nvme/leihaodong/hotpotqa_pool_s3part
@@ -47,7 +47,7 @@ export TRAIN_DIRS="$NVME_A,$LOCAL_B/stage0_train_short200_pool"
 export VAL_DIRS="$LOCAL_B/stage0_dev_short200_pool"
 export OUTPUT_DIR=${OUTPUT_DIR:-$PROJ/checkpoints/offpolicy_v2_hotpotqa_pool_n${NMEM}_forward_kl}
 export TAG=pool_n${NMEM}
-bash $PROJ/scripts/run_offpolicy.sh
+bash $PROJ/scripts/train/run_offpolicy.sh
 
 # best 尝试归档 (桶满则容忍失败, 留本地); latest/final 删掉腾配额.
 S3CK=s3://datafrontier/leihaodong/Project4/checkpoints/$(basename $OUTPUT_DIR)
