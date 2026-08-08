@@ -228,3 +228,4 @@ scripts/smoke
 /checkpoints
 /eval_outputs
 /eval_results
+/tmp
